@@ -1,8 +1,13 @@
 import asyncio
+import io
 import json
 import os
 import sys
 from pathlib import Path
+
+# Force UTF-8 stdout on Windows to handle unicode characters like →
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
 import networkx as nx
 import uvicorn
@@ -63,7 +68,10 @@ def _log(msg: str, pct: int | None = None, is_error: bool = False):
     level = "ERROR" if is_error else "INFO"
     entry = {"ts": ts, "pct": pct, "level": level, "msg": msg}
     _LOG_BUFFER.append(entry)
-    print(f"{ts} {prefix} {msg}")
+    try:
+        print(f"{ts} {prefix} {msg}", flush=True)
+    except UnicodeEncodeError:
+        print(f"{ts} {prefix} {msg}".encode('utf-8', errors='replace').decode('ascii', errors='replace'), flush=True)
 
 
 # ────────────────────────────────────────────────────────────
@@ -109,7 +117,8 @@ async def run_full_analysis(repo_path: str):
             
         structural_G.add_node(n.id, **{
             "name": n.name, "type": n.type, "language": n.language,
-            "file": rel_file, "line_start": n.line_start, "line_end": n.line_end
+            "file": rel_file, "line_start": n.line_start, "line_end": n.line_end,
+            "source_lines": (n.source_lines or "")[:200],
         })
     extract_structural_edges(ALL_FILE_NODES, structural_G)
     await push_progress(f"Structural mapping complete: {structural_G.number_of_edges()} edges found", 45)
@@ -184,20 +193,25 @@ async def run_full_analysis(repo_path: str):
                 for src, tgt, edata in G.edges(data=True)
             ]
             await push_progress(f"Writing {len(nodes_meta)} nodes + {len(edges_meta)} edges to Neo4j...", 93)
-            await asyncio.to_thread(writer.clear_graph)
-            await asyncio.to_thread(writer.write_nodes, nodes_meta)
-            await asyncio.to_thread(writer.write_edges, edges_meta)
-            await asyncio.to_thread(writer.add_cross_language_edges)
-            node_count = await asyncio.to_thread(writer.get_node_count)
-            await asyncio.to_thread(writer.close)
-            await push_progress(f"Neo4j: {node_count} nodes stored in Aura.", 94)
+            try:
+                await asyncio.wait_for(asyncio.to_thread(writer.clear_graph), timeout=10.0)
+                await asyncio.wait_for(asyncio.to_thread(writer.write_nodes, nodes_meta), timeout=20.0)
+                await asyncio.wait_for(asyncio.to_thread(writer.write_edges, edges_meta), timeout=30.0)
+                await asyncio.wait_for(asyncio.to_thread(writer.add_cross_language_edges), timeout=15.0)
+                node_count = await asyncio.wait_for(asyncio.to_thread(writer.get_node_count), timeout=10.0)
+                await push_progress(f"Neo4j: {node_count} nodes stored in Aura.", 94)
+            except asyncio.TimeoutError:
+                _log("  [Neo4j WARN] Write timed out — continuing without Aura persistence")
+                await push_progress("Neo4j write timed out — continuing in NetworkX-only mode.", 94)
+            finally:
+                await asyncio.to_thread(writer.close)
         else:
             _log("  Neo4j not enabled — skipping Aura write")
     except Exception as e:
         _log(f"  [WARN] Neo4j write failed: {e}", is_error=True)
 
     # ── Post-analysis: detect variable chains + API routes ──
-    await push_progress("Detecting cross-language variable chains (DB → Backend → Frontend)...", 95)
+    await push_progress("Detecting cross-language variable chains (DB -> Backend -> Frontend)...", 95)
     try:
         from backend.graph.pipeline import detect_variable_chains, detect_api_routes
         import traceback as _tb

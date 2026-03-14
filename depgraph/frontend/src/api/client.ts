@@ -70,10 +70,15 @@ export interface ImpactResult {
   has_critical_breaks: boolean;
   chain: ImpactChainNode[];
   severity: {
-    score: number;
-    tier: string;
+    score: number;    // 0–∞, CRITICAL≥8, HIGH≥4, MEDIUM≥1
+    tier: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
     color?: string;
-    breakdown?: Record<string, number>;
+    breakdown?: {
+      weighted_dependents: number;
+      api_multiplier: number;
+      coverage_multiplier: number;
+      untested_count: number;
+    };
   };
 }
 
@@ -174,7 +179,18 @@ export const apiClient = {
     return res.data;
   },
 
-  async migrate(nodeId: string, newName: string): Promise<{ success: boolean; plan: string[] }> {
+  async migrate(nodeId: string, newName: string): Promise<{
+    summary: string;
+    safe_order: string[];
+    files: Array<{
+      file: string;
+      language: string;
+      line: number;
+      old_code: string;
+      new_code: string;
+      change_type: string;
+    }>;
+  }> {
     const res = await api.post('/migrate', { node_id: nodeId, new_name: newName });
     return res.data;
   },

@@ -7,7 +7,9 @@ const ImpactTab = () => {
   
   // Find node details from graphData if available
   const nodeInfo = graphData?.nodes.find(n => n.id === selectedNode);
-  const score = impactData?.score ?? nodeInfo?.impact_score ?? 0;
+  const rawScore = impactData?.severity?.score ?? nodeInfo?.severity?.score ?? 0;
+  // severity.score uses CRITICAL>=8 scale; multiply ×10 to map into 0–100 gauge range
+  const score = Math.min(rawScore * 10, 100);
 
   const radius = 52;
   const circumference = 2 * Math.PI * radius;
@@ -79,13 +81,13 @@ const ImpactTab = () => {
       <div className="flex gap-2 justify-center flex-wrap">
         <span className="font-mono text-[11px] px-3 py-1 rounded-full" style={{
           background: 'var(--surface-hex)', border: '1px solid var(--border-2-hex)', color: '#f59e0b'
-        }}>{impactData?.affected_nodes?.length || 0} Nodes</span>
+        }}>{impactData?.chain?.length || 0} Nodes</span>
         <span className="font-mono text-[11px] px-3 py-1 rounded-full" style={{
           background: 'var(--surface-hex)', border: '1px solid var(--border-2-hex)', color: 'var(--teal-hex)'
         }}>{nodeInfo?.language || 'Unknown'}</span>
         <span className="font-mono text-[11px] px-3 py-1 rounded-full" style={{
           background: 'var(--surface-hex)', border: '1px solid var(--border-2-hex)', color: '#a78bfa'
-        }}>{((nodeInfo?.confidence || 0.9) * 100).toFixed(1)}% Conf</span>
+        }}>{impactData?.severity?.tier || nodeInfo?.severity?.tier || 'LOW'}</span>
       </div>
 
       {/* Section divider */}
@@ -96,33 +98,39 @@ const ImpactTab = () => {
 
       {/* Timeline/Paths */}
       <div className="space-y-0 overflow-y-auto max-h-48 pr-1 custom-scrollbar">
-        {impactData?.affected_nodes?.length > 0 ? (
-          impactData.affected_nodes.map((affected: any, i: number) => (
-            <motion.div
-              key={i}
-              initial={{ opacity: 0, x: -12 }}
-              animate={{ opacity: 1, x: 0 }}
-              transition={{ delay: 0.1 + i * 0.05 }}
-              className="flex gap-3"
-            >
-              <div className="flex flex-col items-center w-5">
-                {i > 0 && <div className="w-px flex-1" style={{ background: 'var(--border-2-hex)' }} />}
-                <div className="w-2 h-2 rounded-full shrink-0 my-1" style={{ background: affected.severity > 0.5 ? 'var(--orange-hex)' : 'var(--teal-hex)' }} />
-                {i < impactData.affected_nodes.length - 1 && <div className="w-px flex-1" style={{ background: 'var(--border-2-hex)' }} />}
-              </div>
-              <div className="py-2">
-                <div className="flex items-center gap-2 mb-0.5">
-                  <span className="font-mono text-[12px] truncate max-w-[140px]" style={{ color: 'var(--text-1-hex)' }}>{affected.node_id}</span>
-                  {affected.is_breaking && (
-                    <span className="font-mono text-[9px] px-1.5 py-0.5 rounded-sm" style={{
-                      background: 'rgba(255,87,51,0.1)', color: 'var(--orange-hex)', border: '1px solid rgba(255,87,51,0.35)'
-                    }}>BREAKING</span>
-                  )}
+        {impactData?.chain?.length > 0 ? (
+          impactData.chain.map((item: any, i: number) => {
+            const isBreaking = item.max_break_risk === 'high' || item.max_break_risk === 'critical';
+            const nodeName = item.node?.name || item.node?.id?.split('::').pop() || '?';
+            return (
+              <motion.div
+                key={i}
+                initial={{ opacity: 0, x: -12 }}
+                animate={{ opacity: 1, x: 0 }}
+                transition={{ delay: 0.1 + i * 0.05 }}
+                className="flex gap-3"
+              >
+                <div className="flex flex-col items-center w-5">
+                  {i > 0 && <div className="w-px flex-1" style={{ background: 'var(--border-2-hex)' }} />}
+                  <div className="w-2 h-2 rounded-full shrink-0 my-1" style={{ background: isBreaking ? 'var(--orange-hex)' : 'var(--teal-hex)' }} />
+                  {i < impactData.chain.length - 1 && <div className="w-px flex-1" style={{ background: 'var(--border-2-hex)' }} />}
                 </div>
-                <div className="font-mono text-[11px]" style={{ color: 'var(--text-3-hex)' }}>Impact: {(affected.severity * 100).toFixed(1)}%</div>
-              </div>
-            </motion.div>
-          ))
+                <div className="py-2">
+                  <div className="flex items-center gap-2 mb-0.5">
+                    <span className="font-mono text-[12px] truncate max-w-[140px]" style={{ color: 'var(--text-1-hex)' }}>{nodeName}</span>
+                    {isBreaking && (
+                      <span className="font-mono text-[9px] px-1.5 py-0.5 rounded-sm" style={{
+                        background: 'rgba(255,87,51,0.1)', color: 'var(--orange-hex)', border: '1px solid rgba(255,87,51,0.35)'
+                      }}>BREAKING</span>
+                    )}
+                  </div>
+                  <div className="font-mono text-[11px]" style={{ color: 'var(--text-3-hex)' }}>
+                    Conf: {(item.path_confidence * 100).toFixed(1)}% · {item.node?.language || '?'} · {item.node?.file?.split('/').pop() || ''}
+                  </div>
+                </div>
+              </motion.div>
+            );
+          })
         ) : (
           <div className="font-mono text-[11px] text-center py-4" style={{ color: 'var(--text-4-hex)' }}>No significant downstream impact detected.</div>
         )}
@@ -137,7 +145,7 @@ const ImpactTab = () => {
         {[
           { label: 'AST Proof', pct: 100, color: 'var(--teal-hex)' },
           { label: 'Graph Path', pct: (nodeInfo?.confidence || 0.9) * 100, color: '#38bdf8' },
-          { label: 'LLM Clarity', pct: impactData?.confidence_score ? impactData.confidence_score * 100 : 75, color: '#a78bfa' },
+          { label: 'LLM Clarity', pct: impactData?.severity?.breakdown?.weighted_dependents ? Math.min(impactData.severity.breakdown.weighted_dependents * 10, 100) : 75, color: '#a78bfa' },
         ].map((bar, i) => (
           <div key={bar.label} className="flex items-center gap-2">
             <span className="font-mono text-[11px] w-[90px]" style={{ color: 'var(--text-3-hex)' }}>{bar.label}</span>

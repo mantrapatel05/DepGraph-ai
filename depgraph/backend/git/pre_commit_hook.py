@@ -45,7 +45,7 @@ def main():
                 name = a['node'].get('name', '?')
                 file_ = a['node'].get('file', '?')
                 line = a['node'].get('line_start', '?')
-                print(f"    → BREAKS [{lang}]: {name} in {file_}:{line}")
+                print(f"    -> BREAKS [{lang}]: {name} in {file_}:{line}")
         print(f"\n  Run: python -m backend.query.engine explain <node_id>")
         sys.exit(1)
 

@@ -108,7 +108,8 @@ const LeftSidebar = () => {
     const nodeSeverity: Record<string, boolean> = {};
     graphData.edges.forEach((e: any) => {
         const breakRisk = e.data?.break_risk;
-        if (breakRisk === 'CRITICAL' || breakRisk === 'HIGH') {
+        // Backend uses lowercase: 'high', 'critical'
+        if (breakRisk === 'high' || breakRisk === 'critical' || breakRisk === 'CRITICAL' || breakRisk === 'HIGH') {
             nodeSeverity[e.target] = true;
         }
     });
@@ -117,7 +118,7 @@ const LeftSidebar = () => {
         if (nodeSeverity[n.id]) breakingCount++;
     });
 
-    const aiEdges = graphData.edges.filter((e: any) => e.data?.type === 'llm').length;
+    const aiEdges = graphData.edges.filter((e: any) => e.data?.inferred_by === 'llm').length;
 
     // Group nodes by file path
     const fileMap = new Map<string, FileItem[]>();

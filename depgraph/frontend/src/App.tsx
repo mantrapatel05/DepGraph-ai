@@ -7,7 +7,7 @@ import { AppProvider } from "./context/AppContext";
 
 const App = () => (
   <AppProvider>
-    <BrowserRouter>
+    <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <Routes>
         <Route path="/" element={<LandingPage />} />
         <Route path="/app" element={<MainApp />} />

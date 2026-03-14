@@ -10,7 +10,12 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
+      'd3-force': path.resolve(__dirname, './node_modules/d3-force-3d'),
     },
+  },
+  optimizeDeps: {
+    include: ['d3-force-3d'],
+    exclude: ['d3-force'],
   },
   server: {
     port: 5173,

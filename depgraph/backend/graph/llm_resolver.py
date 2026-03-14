@@ -23,7 +23,9 @@ load_dotenv()
 
 async_client = AsyncOpenAI(
     base_url=os.getenv("FEATHERLESS_BASE_URL", "https://api.featherless.ai/v1"),
-    api_key=os.getenv("FEATHERLESS_API_KEY", "")
+    api_key=os.getenv("FEATHERLESS_API_KEY", ""),
+    timeout=90.0,       # large batches (51 nodes) need more time
+    max_retries=0,      # no SDK-level retries — we handle that ourselves
 )
 MODEL = os.getenv("FEATHERLESS_MODEL", "zai-org/GLM-4.7")
 
@@ -32,6 +34,40 @@ _annotation_cache: dict[str, dict] = {}
 
 # One in-flight request at a time for Featherless rate limits
 _sem = asyncio.Semaphore(1)
+
+# Pre-flight availability flag — set once on first call
+_llm_available: bool | None = None
+
+
+async def _check_availability() -> bool:
+    """One-time check: can we reach the LLM API at all?  Fast-fails in ~5s."""
+    global _llm_available
+    if _llm_available is True:
+        return True
+    if _llm_available is False:
+        return False  # auth error already confirmed — don't retry
+    try:
+        await asyncio.wait_for(
+            async_client.chat.completions.create(
+                model=MODEL, max_tokens=5,
+                messages=[{"role": "user", "content": "ping"}]
+            ),
+            timeout=20.0,
+        )
+        _llm_available = True
+        print("  [LLM] API reachable — semantic annotation enabled")
+    except Exception as e:
+        status = getattr(e, "status_code", None)
+        err = str(e)
+        is_auth = status in (401, 403) or "invalid api key" in err.lower() or "unauthorized" in err.lower()
+        if is_auth:
+            _llm_available = False
+            print(f"  [LLM] API unavailable ({type(e).__name__}: {err[:80]}) — structural-only mode")
+        else:
+            # Transient error (timeout, network) — assume available, real calls will handle it
+            _llm_available = True
+            print(f"  [LLM WARN] ping failed ({type(e).__name__}: {err[:60]}) — assuming available, proceeding")
+    return _llm_available
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -62,56 +98,76 @@ def build_context_window(node: CodeNode, node_index: dict) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # Call 1: Batch-annotate all boundary nodes in ONE LLM call
 # ─────────────────────────────────────────────────────────────────────────────
-async def _call_with_retry(prompt: str, max_tokens: int, context_label: str) -> str:
-    """Make one LLM call with exponential-backoff retry on rate-limit errors."""
-    async with _sem:
-        for attempt in range(5):
-            try:
-                response = await asyncio.wait_for(
-                    async_client.chat.completions.create(
-                        model=MODEL,
-                        max_tokens=max_tokens,
-                        messages=[{"role": "user", "content": prompt}]
-                    ),
-                    timeout=120.0
-                )
-                return response.choices[0].message.content.strip()
-            except asyncio.TimeoutError:
-                print(f"  [LLM] {context_label} timed out (attempt {attempt + 1})")
-                if attempt >= 4:
-                    return ""
-                await asyncio.sleep(2 ** attempt)
-            except Exception as e:
-                err = str(e)
-                if "429" in err or "concurrency" in err.lower() or "rate" in err.lower():
-                    wait = 2 ** (attempt + 2)  # 4, 8, 16, 32, 64 s
-                    print(f"  [LLM] Rate-limited — waiting {wait}s (attempt {attempt + 1})")
-                    await asyncio.sleep(wait)
-                    continue
-                print(f"  [LLM WARN] {context_label} failed (attempt {attempt + 1}): {e}")
-                if attempt >= 4:
-                    return ""
+async def _call_with_retry(prompt: str, max_tokens: int, context_label: str, timeout: float = 90.0) -> str:
+    """Make one LLM call. Skips instantly if API is unavailable."""
+    global _llm_available
+    if not await _check_availability():
         return ""
+
+    async with _sem:
+        try:
+            response = await asyncio.wait_for(
+                async_client.chat.completions.create(
+                    model=MODEL,
+                    max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}]
+                ),
+                timeout=timeout,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            err = str(e)
+            is_rate_limit = (status == 429 or "429" in err
+                             or "concurrency" in err.lower()
+                             or "rate" in err.lower())
+            is_timeout = isinstance(e, (asyncio.TimeoutError, TimeoutError)) or "timeout" in err.lower()
+            is_auth_error = status in (401, 403) or "invalid api key" in err.lower() or "unauthorized" in err.lower()
+            if is_rate_limit:
+                print(f"  [LLM] Rate-limited on {context_label} — skipping remainder")
+            elif is_timeout:
+                # Timeout on a big batch — log but keep API available for next call
+                print(f"  [LLM WARN] {context_label}: timeout on large batch — will retry with smaller chunks")
+            elif is_auth_error:
+                print(f"  [LLM WARN] {context_label}: auth error ({status}) — disabling LLM for this run")
+                _llm_available = False
+            else:
+                print(f"  [LLM WARN] {context_label}: {type(e).__name__}: {err[:80]}")
+            return ""
 
 
 def _strip_markdown(text: str) -> str:
-    """Remove ```json ... ``` fences if present."""
+    """Extract JSON content from a response that may contain preamble or markdown fences."""
     text = text.strip()
-    if text.startswith("```"):
+    # If there's a ```...``` fence anywhere, pull the content out
+    if "```" in text:
         parts = text.split("```")
-        # parts[1] is between first pair of fences
-        text = parts[1] if len(parts) > 1 else text
-        if text.startswith("json"):
-            text = text[4:]
-    return text.strip()
+        # parts[1] is the first fenced block
+        if len(parts) > 1:
+            inner = parts[1]
+            if inner.startswith("json"):
+                inner = inner[4:]
+            text = inner.strip()
+    # If it still doesn't start with { or [, skip to whichever comes first
+    stripped = text.strip()
+    idx_obj = stripped.find('{')
+    idx_arr = stripped.find('[')
+    candidates = [i for i in (idx_obj, idx_arr) if i >= 0]
+    if candidates:
+        first = min(candidates)
+        if first > 0:
+            stripped = stripped[first:]
+    return stripped.strip()
 
 
 async def batch_annotate_nodes(boundary_nodes: list, node_index: dict) -> None:
     """
-    Annotate ALL boundary nodes in a SINGLE LLM call.
+    Annotate ALL boundary nodes in sub-batches of LLM calls.
     Results are written directly into each node's .summary and .metadata.
     Nodes whose content hash is already cached are skipped.
     """
+    if not await _check_availability():
+        return
     # Split into those already cached vs those that need a call
     to_annotate = []
     for node in boundary_nodes:
@@ -127,49 +183,57 @@ async def batch_annotate_nodes(boundary_nodes: list, node_index: dict) -> None:
         print("  [LLM] All boundary nodes served from annotation cache")
         return
 
-    # Build one big prompt listing every node
-    node_snippets = []
-    for idx, (node, _) in enumerate(to_annotate):
-        ctx = build_context_window(node, node_index)
-        node_snippets.append(
-            f"=== NODE {idx} ===\n"
-            f"NODE_ID: {node.id}\n"
-            f"{ctx}\n"
+    _ANNOTATE_BATCH = 15  # max nodes per annotation call to avoid timeouts
+
+    def _build_annotation_prompt(items):
+        snippets = []
+        for idx, (node, _) in enumerate(items):
+            ctx = build_context_window(node, node_index)
+            snippets.append(
+                f"=== NODE {idx} ===\n"
+                f"NODE_ID: {node.id}\n"
+                f"{ctx}\n"
+            )
+        return (
+            "You are analyzing nodes in a polyglot codebase dependency system.\n\n"
+            "For EACH node below, extract a JSON annotation object.\n"
+            "Return a single JSON object mapping each NODE_ID to its annotation.\n"
+            "Schema per node:\n"
+            '{\n'
+            '  "summary": "one sentence: what this is and what data it holds or transforms",\n'
+            '  "data_in": ["field names this node receives"],\n'
+            '  "data_out": ["field names this node exposes"],\n'
+            '  "transformations": ["snake_to_camel | null_stripped | type_cast | serialization"],\n'
+            '  "sensitivity": "none | low | medium | high | pii",\n'
+            '  "boundary_signals": ["patterns indicating cross-language data flow"]\n'
+            '}\n\n'
+            "Return ONLY valid JSON — no markdown, no explanation:\n"
+            '{\n  "<NODE_ID>": { ... }, ...\n}\n\n'
+            + "\n---\n".join(snippets)
         )
 
-    prompt = (
-        "You are analyzing nodes in a polyglot codebase dependency system.\n\n"
-        "For EACH node below, extract a JSON annotation object.\n"
-        "Return a single JSON object mapping each NODE_ID to its annotation.\n"
-        "Schema per node:\n"
-        '{\n'
-        '  "summary": "one sentence: what this is and what data it holds or transforms",\n'
-        '  "data_in": ["field names this node receives"],\n'
-        '  "data_out": ["field names this node exposes"],\n'
-        '  "transformations": ["snake_to_camel | null_stripped | type_cast | serialization"],\n'
-        '  "sensitivity": "none | low | medium | high | pii",\n'
-        '  "boundary_signals": ["patterns indicating cross-language data flow"]\n'
-        '}\n\n'
-        "Return ONLY valid JSON — no markdown, no explanation:\n"
-        '{\n  "<NODE_ID>": { ... }, ...\n}\n\n'
-        + "\n---\n".join(node_snippets)
-    )
-
-    print(f"  [LLM] Batch-annotating {len(to_annotate)} boundary nodes in 1 call...")
-    raw = await _call_with_retry(prompt, max_tokens=min(3000, 200 * len(to_annotate)), context_label="batch_annotate")
-
-    # Parse the JSON response
+    # Process in sub-batches to avoid timeout on large repos
     annotations: dict = {}
-    try:
-        annotations = json.loads(_strip_markdown(raw))
-    except json.JSONDecodeError:
-        # Try to salvage partial JSON
-        try:
-            # Sometimes the model truncates — try to close the object
-            fixed = raw.rsplit(',', 1)[0] + "\n}"
-            annotations = json.loads(_strip_markdown(fixed))
-        except Exception:
-            print("  [LLM WARN] batch_annotate: could not parse JSON response — using defaults")
+    total_batches = (len(to_annotate) + _ANNOTATE_BATCH - 1) // _ANNOTATE_BATCH
+    for bi in range(total_batches):
+        sub = to_annotate[bi * _ANNOTATE_BATCH:(bi + 1) * _ANNOTATE_BATCH]
+        prompt = _build_annotation_prompt(sub)
+        label = f"batch_annotate[{bi*_ANNOTATE_BATCH}:{bi*_ANNOTATE_BATCH+len(sub)}]"
+        print(f"  [LLM] Batch-annotating {len(sub)} nodes ({label})...")
+        raw = await _call_with_retry(prompt, max_tokens=min(4000, 200 * len(sub)), context_label=label)
+
+        # Parse this sub-batch response and merge into annotations
+        if raw:
+            try:
+                batch_ann = json.loads(_strip_markdown(raw))
+                annotations.update(batch_ann)
+            except json.JSONDecodeError:
+                try:
+                    fixed = raw.rsplit(',', 1)[0] + "\n}"
+                    batch_ann = json.loads(_strip_markdown(fixed))
+                    annotations.update(batch_ann)
+                except Exception:
+                    print(f"  [LLM WARN] {label}: could not parse JSON response — using defaults for this batch")
 
     default_annotation = {
         "summary": "", "data_in": [], "data_out": [],
@@ -250,7 +314,7 @@ async def traverse_and_annotate(node: CodeNode, node_index: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 # Call 2 (+ optional Call 3): Batch-resolve ALL boundary pairs
 # ─────────────────────────────────────────────────────────────────────────────
-_PAIRS_PER_BATCH = 15   # max pairs per LLM call; adjust if context window is exceeded
+_PAIRS_PER_BATCH = 5    # small batches to avoid timeout on free-tier OpenRouter
 
 
 async def resolve_boundary_edges(pairs: list, node_index: dict) -> list[dict]:
@@ -258,7 +322,12 @@ async def resolve_boundary_edges(pairs: list, node_index: dict) -> list[dict]:
     Resolve cross-language edges for ALL pairs using at most ⌈N/PAIRS_PER_BATCH⌉ calls.
     Typically 1-2 calls for the sample project (≤25 pairs after capping in boundary.py).
     """
+    print(f"  [LLM DEBUG] resolve_boundary_edges called: {len(pairs)} pairs, _llm_available={_llm_available}")
     if not pairs:
+        return []
+    avail = await _check_availability()
+    print(f"  [LLM DEBUG] _check_availability returned: {avail}")
+    if not avail:
         return []
 
     all_edges: list[dict] = []
@@ -309,7 +378,7 @@ async def resolve_boundary_edges(pairs: list, node_index: dict) -> list[dict]:
         print(f"  [LLM] Resolving {len(batch)} pairs in 1 call ({batch_label})...")
         raw = await _call_with_retry(
             prompt,
-            max_tokens=min(2000, 120 * len(batch)),
+            max_tokens=min(4000, 400 * len(batch)),
             context_label=batch_label
         )
 
@@ -322,15 +391,26 @@ async def resolve_boundary_edges(pairs: list, node_index: dict) -> list[dict]:
                 else:
                     print(f"  [LLM WARN] {batch_label}: expected list, got {type(edges)}")
             except json.JSONDecodeError:
-                # Try partial salvage
-                try:
-                    # Close truncated array
-                    fixed = raw.rsplit(',', 1)[0] + "\n]"
-                    edges = json.loads(_strip_markdown(fixed))
-                    if isinstance(edges, list):
-                        all_edges.extend(edges)
-                        print(f"  [LLM] {batch_label}: {len(edges)} edge(s) (salvaged)")
-                except Exception:
+                # Try to salvage by finding the last complete JSON object in the array
+                salvaged = False
+                text = _strip_markdown(raw)
+                # Walk back from end looking for last complete '}' that closes an object
+                last_close = text.rfind('}')
+                if last_close > 0:
+                    candidate = text[:last_close + 1]
+                    # Ensure it's a valid array
+                    if not candidate.lstrip().startswith('['):
+                        candidate = '[' + candidate
+                    candidate = candidate + ']'
+                    try:
+                        edges = json.loads(candidate)
+                        if isinstance(edges, list) and edges:
+                            all_edges.extend(edges)
+                            print(f"  [LLM] {batch_label}: {len(edges)} edge(s) (salvaged)")
+                            salvaged = True
+                    except Exception:
+                        pass
+                if not salvaged:
                     print(f"  [LLM WARN] {batch_label}: could not parse response — skipping batch")
 
     return all_edges

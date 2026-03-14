@@ -97,18 +97,24 @@ def extract_structural_edges(all_file_nodes: list, G: nx.DiGraph):
                 conf = naming_confidence(node.name, camel)
                 found_conv = False
                 for cid, candidate in node_index.items():
-                    if (candidate.language in ("typescript", "react")
-                            and candidate.name == camel
-                            and candidate.type == "variable"):
-                        if G.has_node(node.id) and G.has_node(cid):
-                            G.add_edge(node.id, cid,
-                                       type="CONVENTION_MAP",
-                                       confidence=conf,
-                                       inferred_by="naming",
-                                       transformation="snake_to_camel",
-                                       break_risk="medium",
-                                       break_reason="Convention match: rename breaks camelCase TS consumer")
-                            found_conv = True
+                    # Direct name match (TypeScript interface props)
+                    name_match = (candidate.language in ("typescript", "react")
+                                  and candidate.name == camel
+                                  and candidate.type == "variable")
+                    # React member_expression: user.userEmail — match via access_property
+                    access_match = (candidate.language == "react"
+                                    and candidate.type == "variable"
+                                    and candidate.metadata.get("access_property") == camel)
+                    if (name_match or access_match) and G.has_node(node.id) and G.has_node(cid):
+                        G.add_edge(node.id, cid,
+                                   type="CONVENTION_MAP",
+                                   confidence=conf,
+                                   inferred_by="naming",
+                                   transformation="snake_to_camel",
+                                   transformation_example=f"{node.name} → {camel}",
+                                   break_risk="high",
+                                   break_reason=f"Rename breaks camelCase consumer: {node.name} → {camel}")
+                        found_conv = True
                 if found_conv:
                     print(f"  [DEBUG] Convention map: {node.name} -> {camel}")
 
@@ -178,3 +184,46 @@ def extract_structural_edges(all_file_nodes: list, G: nx.DiGraph):
                                    transformation="none",
                                    break_risk="medium",
                                    break_reason="Inheritance: rename breaks subclass")
+
+        # ──────────────────────────────────────────────────────────
+        # RULE 5: Python variable → Pydantic field same-name link (confidence = 0.95)
+        # ORM Column field in models.py → matching Pydantic field in schemas.py
+        # ──────────────────────────────────────────────────────────
+        if node.language == "python" and node.type == "variable":
+            if "Column(" in node.source_lines:
+                # This is an ORM field — find matching Pydantic field with same name
+                for cid, candidate in node_index.items():
+                    if (cid != node.id
+                            and candidate.language == "python"
+                            and candidate.type == "variable"
+                            and candidate.name == node.name
+                            and "Column(" not in candidate.source_lines):
+                        if G.has_node(node.id) and G.has_node(cid):
+                            G.add_edge(node.id, cid,
+                                       type="SCHEMA_MAP",
+                                       confidence=0.95,
+                                       inferred_by="naming",
+                                       transformation="direct",
+                                       break_risk="high",
+                                       break_reason="Pydantic schema field must match ORM field name for consistent serialization")
+
+        # ──────────────────────────────────────────────────────────
+        # RULE 6: TypeScript interface prop → React member_expression RENDERS edge
+        # types.ts::UserDTO::userEmail → UserProfile.tsx::user.userEmail  (confidence = 0.88)
+        # Uses the access_property metadata written by the TypeScript parser
+        # ──────────────────────────────────────────────────────────
+        if node.language == "typescript" and node.type == "variable":
+            prop_name = node.name
+            for cid, candidate in node_index.items():
+                if (candidate.language == "react"
+                        and candidate.type == "variable"
+                        and candidate.metadata.get("access_property") == prop_name):
+                    if G.has_node(node.id) and G.has_node(cid):
+                        G.add_edge(node.id, cid,
+                                   type="RENDERS",
+                                   confidence=0.88,
+                                   inferred_by="naming",
+                                   transformation="prop_access",
+                                   transformation_example=f"{prop_name} → data.{prop_name}",
+                                   break_risk="high",
+                                   break_reason=f"React JSX accesses .{prop_name} — silently renders undefined if interface prop is renamed")
