@@ -24,25 +24,41 @@ def get_child_text(node, field_name: str, source: bytes) -> str:
 
 
 def extract_attribute_node(node, parent_id: str, source: bytes, filepath: str):
-    """Extract a class attribute (Column(), field, etc.) as a CodeNode."""
+    """Extract a class attribute (Column(), field, annotated field, etc.) as a CodeNode."""
     src = source[node.start_byte:node.end_byte].decode('utf-8', errors='replace').strip()
-    if '=' in src and len(src) < 300:
+
+    name = None
+
+    # Handle annotated_assignment: `name: type = value` OR `name: type` (Pydantic fields)
+    if node.type == "annotated_assignment":
+        left = node.child_by_field_name("left")
+        if left:
+            name = source[left.start_byte:left.end_byte].decode('utf-8', errors='replace').strip()
+            # Strip any subscript/complex expression — only keep simple identifiers
+            if ':' in name:
+                name = name.split(':')[0].strip()
+        elif ':' in src:
+            # Fallback: take everything before the first colon
+            name = src.split(':')[0].strip()
+
+    elif '=' in src and len(src) < 300:
         name = src.split('=')[0].strip()
-        # Support type-annotated fields: name: Type = ...
+        # Support `name: Type = ...`
         if ':' in name:
             name = name.split(':')[0].strip()
-        if name.isidentifier():
-            return CodeNode(
-                id=f"{parent_id}::{name}",
-                type="variable",
-                language="python",
-                name=name,
-                source_lines=src,
-                file=filepath,
-                line_start=node.start_point[0],
-                line_end=node.end_point[0],
-                parent_id=parent_id
-            )
+
+    if name and name.isidentifier() and not name.startswith('__'):
+        return CodeNode(
+            id=f"{parent_id}::{name}",
+            type="variable",
+            language="python",
+            name=name,
+            source_lines=src,
+            file=filepath,
+            line_start=node.start_point[0],
+            line_end=node.end_point[0],
+            parent_id=parent_id
+        )
     return None
 
 
@@ -88,12 +104,19 @@ def parse_python_file(filepath: str) -> CodeNode:
                 line_end=node.end_point[0],
                 parent_id=filepath
             )
-            # Extract class body attributes
-            for child in walk_ast(node):
-                if child.type in ("assignment", "expression_statement", "annotated_assignment"):
-                    attr = extract_attribute_node(child, class_node.id, source, filepath)
-                    if attr:
-                        class_node.children.append(attr)
+
+            # Only walk the DIRECT class body children — do NOT recurse into methods.
+            # This prevents capturing assignments inside method bodies as class fields.
+            body = node.child_by_field_name("body")
+            if body:
+                for child in body.children:
+                    if child.type in ("assignment", "expression_statement", "annotated_assignment"):
+                        attr = extract_attribute_node(child, class_node.id, source, filepath)
+                        if attr:
+                            # Avoid duplicate IDs (can happen with property re-use patterns)
+                            if not any(c.id == attr.id for c in class_node.children):
+                                class_node.children.append(attr)
+
             file_node.children.append(class_node)
 
     return file_node
@@ -120,7 +143,8 @@ def _extract_python_regex(file_node: CodeNode, source: str, filepath: str):
             )
             file_node.children.append(current_class)
         if current_class:
-            attr_match = re.match(r'\s+(\w+)\s*=\s*Column\(', line)
+            # Match `attr = Column(...)` (SQLAlchemy ORM)
+            attr_match = re.match(r'^\s{4}(\w+)\s*=\s*Column\(', line)
             if attr_match:
                 attr = CodeNode(
                     id=f"{current_class.id}::{attr_match.group(1)}",
@@ -134,3 +158,24 @@ def _extract_python_regex(file_node: CodeNode, source: str, filepath: str):
                     parent_id=current_class.id
                 )
                 current_class.children.append(attr)
+            # Match Pydantic annotated fields: `attr: type` or `attr: type = default`
+            pydantic_match = re.match(r'^\s{4}(\w+)\s*:\s*\w+', line)
+            if pydantic_match:
+                name = pydantic_match.group(1)
+                if name not in ('class', 'def', 'model_config') and not name.startswith('__'):
+                    attr = CodeNode(
+                        id=f"{current_class.id}::{name}",
+                        type="variable",
+                        language="python",
+                        name=name,
+                        source_lines=line.strip(),
+                        file=filepath,
+                        line_start=i,
+                        line_end=i,
+                        parent_id=current_class.id
+                    )
+                    if not any(c.id == attr.id for c in current_class.children):
+                        current_class.children.append(attr)
+        # Reset class context when we exit the class indent
+        if current_class and i > 0 and line and not line[0].isspace() and not line.startswith('class'):
+            current_class = None

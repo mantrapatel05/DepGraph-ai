@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, useRef } from 'react';
-import { apiClient, GraphData, ImpactResult } from '@/api/client';
+import { apiClient, GraphData, ImpactResult, VariableChain, RouteNode } from '@/api/client';
 
 export interface TerminalLine {
   id: string;
@@ -10,7 +10,7 @@ export interface TerminalLine {
 
 interface AppState {
   selectedNode: string | null;
-  activeTab: 'impact' | 'chat' | 'migrate';
+  activeTab: 'impact' | 'chat' | 'migrate' | 'chains';
   analysisRunning: boolean;
   analysisComplete: boolean;
   filterBreakingOnly: boolean;
@@ -23,11 +23,14 @@ interface AppState {
   impactData: ImpactResult | null;
   impactLoading: boolean;
   selectedDiffFile: string | null;
+  chains: VariableChain[];
+  chainsLoading: boolean;
+  routes: RouteNode[];
 }
 
 interface AppContextType extends AppState {
   setSelectedNode: (node: string | null) => void;
-  setActiveTab: (tab: 'impact' | 'chat' | 'migrate') => void;
+  setActiveTab: (tab: 'impact' | 'chat' | 'migrate' | 'chains') => void;
   setAnalysisRunning: (v: boolean) => void;
   setAnalysisComplete: (v: boolean) => void;
   setFilterBreakingOnly: (v: boolean) => void;
@@ -36,6 +39,7 @@ interface AppContextType extends AppState {
   addTerminalLine: (line: TerminalLine) => void;
   selectNode: (nodeId: string | null) => void;
   loadGraphData: () => Promise<void>;
+  loadChains: () => Promise<void>;
   startAnalysisStream: (repoUrl: string) => Promise<void>;
   repoUrl: string;
   setRepoUrl: (url: string) => void;
@@ -53,7 +57,7 @@ export const useApp = () => {
 
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'impact' | 'chat' | 'migrate'>('chat');
+  const [activeTab, setActiveTab] = useState<'impact' | 'chat' | 'migrate' | 'chains'>('chat');
   const [analysisRunning, setAnalysisRunning] = useState(false);
   const [analysisComplete, setAnalysisComplete] = useState(false);
   const [filterBreakingOnly, setFilterBreakingOnly] = useState(false);
@@ -70,6 +74,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [impactLoading, setImpactLoading] = useState(false);
   const [selectedDiffFile, setSelectedDiffFile] = useState<string | null>(null);
 
+  const [chains, setChains] = useState<VariableChain[]>([]);
+  const [chainsLoading, setChainsLoading] = useState(false);
+  const [routes, setRoutes] = useState<RouteNode[]>([]);
+
   const wsRef = useRef<WebSocket | null>(null);
 
   const addTerminalLine = useCallback((line: TerminalLine) => {
@@ -80,12 +88,33 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setGraphLoading(true);
     setGraphError(null);
     try {
-      const data = await apiClient.getGraph();
-      setGraphData(data);
+      const raw = await apiClient.getGraph();
+      // The API returns nodes as {id, data:{name,language,...,severity}, position:{x,y}}.
+      // Flatten `data` into the top-level so GraphCanvas can access node.name etc. directly.
+      const flattenedNodes = (raw.nodes as any[]).map((n: any) => ({
+        id: n.id,
+        ...(n.data ?? n),   // spread nested data; if already flat, spread n itself
+        position: n.position ?? { x: 0, y: 0 },
+      }));
+      setGraphData({ nodes: flattenedNodes as any, edges: raw.edges });
     } catch (err: any) {
       setGraphError(err.message || 'Failed to load graph');
     } finally {
       setGraphLoading(false);
+    }
+  }, []);
+
+  const loadChains = useCallback(async () => {
+    setChainsLoading(true);
+    try {
+      const res = await apiClient.getChains();
+      setChains(res.chains || []);
+      const rr = await apiClient.getRoutes();
+      setRoutes(rr.routes || []);
+    } catch {
+      // silently ignore — chains are a bonus feature
+    } finally {
+      setChainsLoading(false);
     }
   }, []);
 
@@ -141,6 +170,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
              setAnalysisComplete(true);
              ws.close();
              loadGraphData();
+             loadChains();
            }
         }
       } catch (e) {
@@ -171,7 +201,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       });
     };
 
-  }, [addTerminalLine, loadGraphData]);
+  }, [addTerminalLine, loadGraphData, loadChains]);
 
   const selectNode = useCallback((nodeId: string | null) => {
     setSelectedNode(nodeId);
@@ -185,8 +215,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   useEffect(() => {
     loadGraphData().then(() => {
       setAnalysisComplete(true);
+      loadChains();
     });
-  }, [loadGraphData]);
+  }, [loadGraphData, loadChains]);
 
   return (
     <AppContext.Provider value={{
@@ -195,9 +226,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       filterBreakingOnly, setFilterBreakingOnly, filterHideLowConf, setFilterHideLowConf,
       terminalLines,
       terminalCollapsed, setTerminalCollapsed, addTerminalLine, selectNode,
-      graphData, graphLoading, graphError, loadGraphData, startAnalysisStream,
+      graphData, graphLoading, graphError, loadGraphData, loadChains, startAnalysisStream,
       repoUrl, setRepoUrl, impactData, impactLoading, loadImpactData,
-      selectedDiffFile, setSelectedDiffFile
+      selectedDiffFile, setSelectedDiffFile,
+      chains, chainsLoading, routes,
     }}>
       {children}
     </AppContext.Provider>

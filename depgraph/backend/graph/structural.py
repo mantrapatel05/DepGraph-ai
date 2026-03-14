@@ -113,10 +113,10 @@ def extract_structural_edges(all_file_nodes: list, G: nx.DiGraph):
                     print(f"  [DEBUG] Convention map: {node.name} -> {camel}")
 
         # ──────────────────────────────────────────────────────────
-        # RULE 3: TypeScript import tracking (confidence = 1.0)
+        # RULE 3: TypeScript/JS import tracking (confidence = 1.0)
         # import { X } from "..."  → find X in typescript nodes
         # ──────────────────────────────────────────────────────────
-        if node.language in ("typescript", "react"):
+        if node.language in ("typescript", "react", "javascript"):
             imports = re.findall(
                 r"import\s+\{([^}]+)\}\s+from\s+['\"]([^'\"]+)['\"]",
                 node.source_lines
@@ -126,7 +126,7 @@ def extract_structural_edges(all_file_nodes: list, G: nx.DiGraph):
                     sym = sym.strip()
                     if not sym:
                         continue
-                    target_id = find_by_name(sym, node_index, ["typescript", "react"])
+                    target_id = find_by_name(sym, node_index, ["typescript", "react", "javascript"])
                     if target_id and G.has_node(node.id) and G.has_node(target_id):
                         G.add_edge(node.id, target_id,
                                    type="IMPORTS",
@@ -135,3 +135,46 @@ def extract_structural_edges(all_file_nodes: list, G: nx.DiGraph):
                                    transformation="none",
                                    break_risk="low",
                                    break_reason="Import reference: rename breaks this import")
+
+        # ──────────────────────────────────────────────────────────
+        # RULE 4: Python import tracking (confidence = 1.0)
+        # from module import X  →  find X in python nodes
+        # Also tracks class inheritance: class Child(Parent)
+        # ──────────────────────────────────────────────────────────
+        if node.language == "python":
+            # from X import Y, Z
+            py_imports = re.findall(
+                r'from\s+[\w.]+\s+import\s+([\w,\s]+)',
+                node.source_lines
+            )
+            for import_group in py_imports:
+                for sym in import_group.split(','):
+                    sym = sym.strip()
+                    if not sym or sym == '*':
+                        continue
+                    target_id = find_by_name(sym, node_index, ["python"])
+                    if target_id and node.id != target_id and G.has_node(node.id) and G.has_node(target_id):
+                        G.add_edge(node.id, target_id,
+                                   type="IMPORTS",
+                                   confidence=1.0,
+                                   inferred_by="ast",
+                                   transformation="none",
+                                   break_risk="low",
+                                   break_reason="Python import: rename breaks this import")
+
+            # class Child(Parent) → inheritance edge
+            bases = re.findall(r'class\s+\w+\(([^)]+)\)', node.source_lines)
+            for base_group in bases:
+                for base in base_group.split(','):
+                    base = base.strip().split('[')[0]  # strip generics
+                    if not base or base in ('object', 'ABC', 'BaseModel', 'Enum'):
+                        continue
+                    target_id = find_by_name(base, node_index, ["python"])
+                    if target_id and node.id != target_id and G.has_node(node.id) and G.has_node(target_id):
+                        G.add_edge(node.id, target_id,
+                                   type="INHERITS",
+                                   confidence=1.0,
+                                   inferred_by="ast",
+                                   transformation="none",
+                                   break_risk="medium",
+                                   break_reason="Inheritance: rename breaks subclass")

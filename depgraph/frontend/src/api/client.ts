@@ -10,14 +10,20 @@ export interface GraphNode {
   line_start: number;
   line_end: number;
   summary: string;
-  metadata: {
-    sensitivity?: string;
-    boundary_signals?: string[];
-    is_boundary?: boolean;
-    data_in?: string[];
-    data_out?: string[];
-    transformations?: string[];
+  domain?: string;
+  severity?: {
+    score: number;
+    tier: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
+    color: string;
+    breakdown?: Record<string, number>;
   };
+  // metadata fields flattened at top level after AppContext transforms the response
+  sensitivity?: string;
+  boundary_signals?: string[];
+  is_boundary?: boolean;
+  data_in?: string[];
+  data_out?: string[];
+  transformations?: string[];
 }
 
 export interface GraphEdge {
@@ -75,6 +81,53 @@ export interface ChatResponse {
   answer: string;
 }
 
+// ── Knowledge Graph enrichment types ────────────────────────────────────────
+
+export interface ChainStep {
+  layer: 'database' | 'backend' | 'frontend';
+  node_id: string;
+  name: string;
+  file: string;
+  type: string;
+  line_start: number;
+  relationship?: string;
+  transformation?: string;
+}
+
+export interface VariableChain {
+  name: string;
+  steps: ChainStep[];
+}
+
+export interface ChainsResponse {
+  chains: VariableChain[];
+  count: number;
+}
+
+export interface RouteNode {
+  node_id: string;
+  name: string;
+  file: string;
+  line_start: number;
+  summary: string;
+  data_in: string[];
+  data_out: string[];
+  response_types: { id: string; name: string; file: string }[];
+  sensitivity: string;
+}
+
+export interface RoutesResponse {
+  routes: RouteNode[];
+  count: number;
+}
+
+export interface SectionsResponse {
+  sections: { DATABASE: number; BACKEND: number; FRONTEND: number };
+  cross_section_edges: number;
+  total_nodes: number;
+  total_edges: number;
+}
+
 const API_BASE = 'http://localhost:8000/api';
 
 const api: AxiosInstance = axios.create({
@@ -124,7 +177,22 @@ export const apiClient = {
   async migrate(nodeId: string, newName: string): Promise<{ success: boolean; plan: string[] }> {
     const res = await api.post('/migrate', { node_id: nodeId, new_name: newName });
     return res.data;
-  }
+  },
+
+  async getChains(): Promise<ChainsResponse> {
+    const res = await api.get('/chains');
+    return res.data;
+  },
+
+  async getRoutes(): Promise<RoutesResponse> {
+    const res = await api.get('/routes');
+    return res.data;
+  },
+
+  async getSections(): Promise<SectionsResponse> {
+    const res = await api.get('/sections');
+    return res.data;
+  },
 };
 
 export default apiClient;

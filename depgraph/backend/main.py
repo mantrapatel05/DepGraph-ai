@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from backend.parsers.dispatcher import parse_repo, flatten_tree, build_node_index
 from backend.graph.structural import extract_structural_edges
 from backend.graph.boundary import detect_boundary_nodes, create_boundary_pairs
-from backend.graph.llm_resolver import traverse_and_annotate, resolve_boundary_edges
+from backend.graph.llm_resolver import batch_annotate_nodes, traverse_and_annotate, resolve_boundary_edges
 from backend.graph.knowledge_graph import build_knowledge_graph, save_graph, load_graph
 from backend.query.engine import get_impact, narrate_impact, generate_migration, answer_query
 from backend.query.severity import compute_severity_score
@@ -44,8 +44,26 @@ G: nx.DiGraph | None = None
 ALL_FILE_NODES: list = []
 GRAPH_PATH = str(Path(__file__).resolve().parent.parent / "depgraph_knowledge.json")
 
+# Knowledge graph enrichment state (populated after analysis)
+VARIABLE_CHAINS: list = []
+API_ROUTES: list = []
+
 # Active WebSocket connection for progress streaming
 _progress_ws: WebSocket | None = None
+
+# Rolling in-memory log buffer (last 200 lines)
+from collections import deque
+import datetime
+_LOG_BUFFER: deque = deque(maxlen=200)
+
+
+def _log(msg: str, pct: int | None = None, is_error: bool = False):
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    prefix = f"[{pct}%]" if pct is not None else "[---]"
+    level = "ERROR" if is_error else "INFO"
+    entry = {"ts": ts, "pct": pct, "level": level, "msg": msg}
+    _LOG_BUFFER.append(entry)
+    print(f"{ts} {prefix} {msg}")
 
 
 # ────────────────────────────────────────────────────────────
@@ -53,8 +71,9 @@ _progress_ws: WebSocket | None = None
 # ────────────────────────────────────────────────────────────
 async def push_progress(msg: str, pct: int, is_error: bool = False):
     global _progress_ws
-    print(f"[{pct}%] {msg}")
+    _log(msg, pct, is_error)
     if _progress_ws:
+        
         try:
             # Match frontend expectation: { type: 'progress', message: string, progress: float (0-1), is_error: boolean }
             await _progress_ws.send_json({
@@ -102,28 +121,122 @@ async def run_full_analysis(repo_path: str):
     await push_progress(f"Identified {len(pairs)} cross-language boundary pairs", 60)
 
     total = len(boundary_nodes)
-    await push_progress(f"Running Semantic Annotation with GLM-4.7... (0/{total} nodes)", 70)
-    completed = 0
+    await push_progress(f"Semantic Annotation: batching {total} boundary nodes into 1 LLM call...", 70)
     try:
-        for node in boundary_nodes:
-            await traverse_and_annotate(node, node_index)
-            completed += 1
-            # Push live updates every node, interpolating progress 70→82
-            pct = int(70 + (completed / total) * 12)
-            await push_progress(f"Annotated {completed}/{total} boundary nodes ...", pct)
+        await batch_annotate_nodes(boundary_nodes, node_index)
     except BaseException as e:
-        # CancelledError (uvicorn reload) or any fatal error — log and continue
-        print(f"  [WARN] Annotation interrupted at {completed}/{total}: {e}")
-    await push_progress(f"Semantic annotation complete ({completed}/{total} nodes annotated)", 82)
-    
-    await push_progress("Resolving cross-language semantic edges (AI Resolver)...", 85)
+        print(f"  [WARN] Batch annotation failed: {e} — falling back to per-node annotation")
+        for node in boundary_nodes:
+            try:
+                await traverse_and_annotate(node, node_index)
+            except Exception as inner:
+                print(f"  [WARN] Per-node annotation failed for {node.id}: {inner}")
+    await push_progress(f"Semantic annotation complete ({total} nodes annotated in 1 LLM call)", 82)
+
+    await push_progress(f"Resolving {len(pairs)} boundary pairs (batched LLM calls)...", 85)
     semantic_edges = await resolve_boundary_edges(pairs, node_index)
     
-    await push_progress("Unifying structural and semantic graphs...", 95)
-    G = build_knowledge_graph(ALL_FILE_NODES, structural_G, semantic_edges)
-    save_graph(G, GRAPH_PATH)
-    
-    await push_progress("Analysis complete. Plotting dependencies...", 100)
+    await push_progress("Unifying structural and semantic graphs...", 90)
+    try:
+        G = build_knowledge_graph(ALL_FILE_NODES, structural_G, semantic_edges)
+    except Exception as e:
+        import traceback
+        err_detail = traceback.format_exc()
+        print(f"  [ERROR] build_knowledge_graph failed:\n{err_detail}")
+        await push_progress(f"⚠ Graph build error: {e} — using structural graph only", 91, is_error=True)
+        G = structural_G  # fall back to structural graph so analysis can continue
+
+    try:
+        await asyncio.to_thread(save_graph, G, GRAPH_PATH)
+    except Exception as e:
+        print(f"  [WARN] save_graph failed: {e} — graph is still in memory")
+        await push_progress(f"⚠ Graph save warning: {e}", 92, is_error=True)
+
+    # ── Neo4j: write nodes + edges + cross-language rules ──
+    try:
+        from backend.graph.neo4j_writer import KnowledgeGraphWriter
+        writer = KnowledgeGraphWriter()
+        if writer.enabled:
+            lang_to_layer = {
+                "sql": "database", "python": "backend",
+                "typescript": "frontend", "react": "frontend", "javascript": "frontend",
+            }
+            nodes_meta = [
+                {
+                    "id": nid,
+                    "name": data.get("name", ""),
+                    "language": data.get("language", ""),
+                    "layer": lang_to_layer.get(data.get("language", ""), "backend"),
+                    "file": data.get("file", ""),
+                    "line_start": data.get("line_start", 0),
+                    "node_type": data.get("type", ""),
+                }
+                for nid, data in G.nodes(data=True)
+            ]
+            edges_meta = [
+                {
+                    "src": src, "tgt": tgt,
+                    "type": edata.get("type", "FLOWS_TO"),
+                    "confidence": edata.get("confidence", 0.5),
+                    "inferred_by": edata.get("inferred_by", "ast"),
+                    "break_risk": edata.get("break_risk", "none"),
+                }
+                for src, tgt, edata in G.edges(data=True)
+            ]
+            await push_progress(f"Writing {len(nodes_meta)} nodes + {len(edges_meta)} edges to Neo4j...", 93)
+            await asyncio.to_thread(writer.clear_graph)
+            await asyncio.to_thread(writer.write_nodes, nodes_meta)
+            await asyncio.to_thread(writer.write_edges, edges_meta)
+            await asyncio.to_thread(writer.add_cross_language_edges)
+            node_count = await asyncio.to_thread(writer.get_node_count)
+            await asyncio.to_thread(writer.close)
+            await push_progress(f"Neo4j: {node_count} nodes stored in Aura.", 94)
+        else:
+            _log("  Neo4j not enabled — skipping Aura write")
+    except Exception as e:
+        _log(f"  [WARN] Neo4j write failed: {e}", is_error=True)
+
+    # ── Post-analysis: detect variable chains + API routes ──
+    await push_progress("Detecting cross-language variable chains (DB → Backend → Frontend)...", 95)
+    try:
+        from backend.graph.pipeline import detect_variable_chains, detect_api_routes
+        import traceback as _tb
+
+        _log("  Starting detect_variable_chains...")
+        try:
+            chains_result = await asyncio.wait_for(
+                asyncio.to_thread(detect_variable_chains, G, ALL_FILE_NODES),
+                timeout=30.0
+            )
+            VARIABLE_CHAINS.clear()
+            VARIABLE_CHAINS.extend(chains_result)
+            _log(f"  detect_variable_chains done: {len(VARIABLE_CHAINS)} chains")
+        except asyncio.TimeoutError:
+            _log("  detect_variable_chains timed out after 30s — skipping", is_error=True)
+        except Exception as e:
+            _log(f"  detect_variable_chains error: {e}\n{_tb.format_exc()}", is_error=True)
+
+        _log("  Starting detect_api_routes...")
+        try:
+            routes_result = await asyncio.wait_for(
+                asyncio.to_thread(detect_api_routes, G),
+                timeout=30.0
+            )
+            API_ROUTES.clear()
+            API_ROUTES.extend(routes_result)
+            _log(f"  detect_api_routes done: {len(API_ROUTES)} routes")
+        except asyncio.TimeoutError:
+            _log("  detect_api_routes timed out after 30s — skipping", is_error=True)
+        except Exception as e:
+            _log(f"  detect_api_routes error: {e}\n{_tb.format_exc()}", is_error=True)
+
+        await push_progress(
+            f"Found {len(VARIABLE_CHAINS)} variable chains and {len(API_ROUTES)} API routes.", 98
+        )
+    except Exception as e:
+        _log(f"  [WARN] Chain/route detection failed: {e}", is_error=True)
+
+    await push_progress("Analysis complete. Knowledge graph ready.", 100)
 
 
 # ────────────────────────────────────────────────────────────
@@ -308,7 +421,102 @@ async def health():
         "status": "ok",
         "graph_built": G is not None,
         "nodes": G.number_of_nodes() if G else 0,
-        "edges": G.number_of_edges() if G else 0
+        "edges": G.number_of_edges() if G else 0,
+        "chains": len(VARIABLE_CHAINS),
+        "routes": len(API_ROUTES),
+    }
+
+
+@app.get("/api/logs")
+async def get_logs(n: int = 100):
+    """Return the last N backend log lines (default 100)."""
+    logs = list(_LOG_BUFFER)[-n:]
+    return {
+        "count": len(logs),
+        "logs": logs,
+        "graph_built": G is not None,
+        "nodes": G.number_of_nodes() if G else 0,
+        "edges": G.number_of_edges() if G else 0,
+        "chains": len(VARIABLE_CHAINS),
+        "routes": len(API_ROUTES),
+    }
+
+
+# ────────────────────────────────────────────────────────────
+# Knowledge Graph enrichment endpoints
+# ────────────────────────────────────────────────────────────
+
+@app.get("/api/chains")
+async def get_chains():
+    """
+    Return all detected cross-language variable chains.
+    Each chain traces a data field from DATABASE → BACKEND → FRONTEND.
+    Example: users.user_email (SQL) → User.user_email (Python) → userEmail (TS) → data.userEmail (React)
+    """
+    if G is None:
+        return {"chains": []}
+
+    # If chains already computed, return them
+    if VARIABLE_CHAINS:
+        return {"chains": VARIABLE_CHAINS, "count": len(VARIABLE_CHAINS)}
+
+    # Compute on-the-fly if analysis ran without chain detection
+    try:
+        from backend.graph.pipeline import detect_variable_chains
+        chains = detect_variable_chains(G, ALL_FILE_NODES)
+        return {"chains": chains, "count": len(chains)}
+    except Exception as e:
+        return {"chains": [], "error": str(e)}
+
+
+@app.get("/api/routes")
+async def get_routes():
+    """
+    Return detected API routes with their input/output types and connected frontend consumers.
+    """
+    if G is None:
+        return {"routes": []}
+
+    if API_ROUTES:
+        return {"routes": API_ROUTES, "count": len(API_ROUTES)}
+
+    try:
+        from backend.graph.pipeline import detect_api_routes
+        routes = detect_api_routes(G)
+        return {"routes": routes, "count": len(routes)}
+    except Exception as e:
+        return {"routes": [], "error": str(e)}
+
+
+@app.get("/api/sections")
+async def get_sections():
+    """
+    Return per-section node counts: DATABASE / BACKEND / FRONTEND.
+    Also returns cross-section edge summary.
+    """
+    if G is None:
+        return {"sections": {}, "cross_section_edges": 0}
+
+    lang_to_layer = {
+        "sql": "DATABASE", "python": "BACKEND",
+        "typescript": "FRONTEND", "react": "FRONTEND", "javascript": "FRONTEND",
+    }
+    counts = {"DATABASE": 0, "BACKEND": 0, "FRONTEND": 0}
+    for _, data in G.nodes(data=True):
+        section = lang_to_layer.get(data.get("language", ""), "BACKEND")
+        counts[section] += 1
+
+    cross_edges = sum(
+        1 for src, tgt, edata in G.edges(data=True)
+        if lang_to_layer.get(G.nodes[src].get("language", ""), "?") !=
+           lang_to_layer.get(G.nodes[tgt].get("language", ""), "?")
+    )
+
+    return {
+        "sections": counts,
+        "cross_section_edges": cross_edges,
+        "total_nodes": G.number_of_nodes(),
+        "total_edges": G.number_of_edges(),
     }
 
 

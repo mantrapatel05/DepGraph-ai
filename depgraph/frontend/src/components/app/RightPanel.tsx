@@ -3,15 +3,17 @@ import { useApp } from '@/context/AppContext';
 import ImpactTab from './tabs/ImpactTab';
 import ChatTab from './tabs/ChatTab';
 import MigrateTab from './tabs/MigrateTab';
+import VariableChain from './VariableChain';
 
 const TABS = [
-  { id: 'impact' as const, label: 'IMPACT' },
-  { id: 'chat' as const, label: 'RAG CHAT', dot: true },
+  { id: 'impact' as const,  label: 'IMPACT' },
+  { id: 'chat' as const,    label: 'RAG CHAT', dot: true },
   { id: 'migrate' as const, label: 'MIGRATE' },
+  { id: 'chains' as const,  label: 'CHAINS', dot: true },
 ];
 
 const RightPanel = () => {
-  const { activeTab, setActiveTab } = useApp();
+  const { activeTab, setActiveTab, chains, chainsLoading } = useApp();
 
   return (
     <div className="w-[360px] shrink-0 flex flex-col border-l overflow-hidden" style={{ background: 'var(--base-hex)', borderColor: 'var(--border-1-hex)' }}>
@@ -52,6 +54,7 @@ const RightPanel = () => {
             {activeTab === 'impact' && <ImpactTab />}
             {activeTab === 'chat' && <ChatTab />}
             {activeTab === 'migrate' && <MigrateTab />}
+            {activeTab === 'chains' && <VariableChain chains={chains} loading={chainsLoading} />}
           </motion.div>
         </AnimatePresence>
       </div>

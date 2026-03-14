@@ -1,397 +1,324 @@
-import React, { useMemo, useState } from 'react';
-import dagre from '@dagrejs/dagre';
+/* eslint-disable @typescript-eslint/no-explicit-any */
+// @ts-nocheck  — react-force-graph-3d + three-spritetext lack complete TS types
+import React, {
+  useRef,
+  useEffect,
+  useMemo,
+  useCallback,
+  useState,
+} from 'react';
+import ForceGraph3D from 'react-force-graph-3d';
+import SpriteText from 'three-spritetext';
+import * as THREE from 'three';
 import { useApp } from '@/context/AppContext';
-import { GraphNode } from '@/api/client';
 
-const CANVAS_W = 3000;
-const CANVAS_H = 3000;
+// ─── Constants ────────────────────────────────────────────────────────────────
 
-const NODE_W = 180;
-const NODE_H = 110;
-
-const LANG_COLORS: Record<string, string> = {
-  sql: '#d97706',
-  python: '#7c3aed',
-  typescript: '#2563eb',
-  react: '#059669',
+const LAYER_COLORS: Record<string, string> = {
+  database: '#f59e0b',
+  backend:  '#a78bfa',
+  frontend: '#38bdf8',
 };
 
-const LANG_LABELS: Record<string, string> = {
-  sql: 'DATABASE',
-  python: 'BACKEND',
-  typescript: 'FRONTEND',
-  react: 'UI',
+const LANG_TO_LAYER: Record<string, string> = {
+  sql:        'database',
+  python:     'backend',
+  typescript: 'frontend',
+  react:      'frontend',
+  javascript: 'frontend',
 };
 
-function getEdgePath(fromPos: {x:number, y:number}, toPos: {x:number, y:number}): string {
-  if (!fromPos || !toPos) return '';
-  const x1 = fromPos.x + NODE_W / 2;
-  const y1 = fromPos.y + NODE_H;
-  const x2 = toPos.x + NODE_W / 2;
-  const y2 = toPos.y;
-  
-  // A simple cubic bezier curve going downwards
-  const yOffset = Math.abs(y2 - y1) * 0.5;
-  return `M ${x1} ${y1} C ${x1} ${y1 + yOffset}, ${x2} ${y2 - yOffset}, ${x2} ${y2}`;
+const EDGE_COLORS: Record<string, string> = {
+  MAPS_TO:           '#00e5b8',
+  SERIALIZES_TO:     '#38bdf8',
+  EXPOSES_AS:        '#818cf8',
+  RENDERS:           '#34d399',
+  FLOWS_TO:          '#7c3aed',
+  TRANSFORMS:        '#f59e0b',
+  BREAKS_IF_RENAMED: '#ff5733',
+  CALLS:             '#4a6888',
+  IMPORTS:           '#2a4060',
+};
+
+function getLayer(lang: string): string {
+  return LANG_TO_LAYER[lang] || 'backend';
 }
 
-interface NodeCardProps {
-  node: GraphNode;
-  selected: boolean;
-  dimmed: boolean;
-  onClick: () => void;
-  severityScore?: number;
-  severityTier?: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
+function getLayerColor(node: any): string {
+  const layer = node.layer || getLayer(node.language || '');
+  return LAYER_COLORS[layer] || '#4a6888';
 }
 
-function NodeCard({ node, selected, dimmed, onClick, severityTier }: NodeCardProps) {
-  const color = LANG_COLORS[node.language] || '#4a6888';
-  const label = LANG_LABELS[node.language] || node.language.toUpperCase();
-  const isBreaking = severityTier === 'CRITICAL' || severityTier === 'HIGH';
+// ─── 3-D Knowledge Graph Canvas ──────────────────────────────────────────────
 
-  return (
-    <div
-      onClick={onClick}
-      style={{
-        width: `${NODE_W}px`,
-        height: `${NODE_H}px`,
-        background: '#0c1520',
-        border: `1px solid ${selected ? '#00e5b8' : isBreaking ? 'rgba(255,87,51,0.3)' : '#1e3048'}`,
-        borderLeft: `3px solid ${color}`,
-        borderRadius: '10px',
-        padding: '10px 12px',
-        cursor: 'pointer',
-        boxShadow: selected
-          ? '0 0 0 1px #00e5b8, 0 0 20px rgba(0,229,184,0.15)'
-          : isBreaking
-          ? '0 0 12px rgba(255,87,51,0.1)'
-          : 'none',
-        opacity: dimmed ? 0.3 : 1,
-        transition: 'all 0.2s ease',
-        userSelect: 'none',
-        overflow: 'hidden',
-        display: 'flex',
-        flexDirection: 'column'
-      }}
-    >
-      {/* Top row */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
-        <span style={{
-          fontFamily: 'Fragment Mono, monospace',
-          fontSize: '9px',
-          color,
-          textTransform: 'uppercase',
-          letterSpacing: '0.1em',
-          background: `${color}18`,
-          border: `1px solid ${color}35`,
-          padding: '1px 5px',
-          borderRadius: '3px',
-        }}>
-          {label}
-        </span>
-        {severityTier && severityTier !== 'LOW' && (
-          <span style={{
-            fontFamily: 'Fragment Mono, monospace',
-            fontSize: '8px',
-            textTransform: 'uppercase',
-            letterSpacing: '0.08em',
-            color: severityTier === 'CRITICAL' ? '#ff5733' : '#f87171',
-            background: severityTier === 'CRITICAL' ? 'rgba(255,87,51,0.1)' : 'rgba(239,68,68,0.1)',
-            border: `1px solid ${severityTier === 'CRITICAL' ? 'rgba(255,87,51,0.3)' : 'rgba(239,68,68,0.2)'}`,
-            padding: '1px 5px',
-            borderRadius: '3px',
-            animation: severityTier === 'CRITICAL' ? 'pulse-glow 2s ease-in-out infinite' : 'none',
-          }}>
-            {severityTier}
-          </span>
-        )}
-      </div>
+const GraphCanvas: React.FC = () => {
+  const { graphData, selectedNode, selectNode } = useApp();
+  const fgRef = useRef<any>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
 
-      {/* Name */}
-      <div style={{
-        fontFamily: 'Fragment Mono, monospace',
-        fontSize: '13px',
-        fontWeight: '500',
-        color: '#e8f0fa',
-        marginBottom: '4px',
-        whiteSpace: 'nowrap',
-        overflow: 'hidden',
-        textOverflow: 'ellipsis',
-      }}>
-        {node.name}
-      </div>
-      
-      {/* Type & File */}
-      <div style={{
-          fontFamily: 'Fragment Mono, monospace',
-          fontSize: '9px',
-          color: '#8da4bd',
-          marginBottom: '4px',
-        }}>
-          [{node.type}] {node.file.split('/').pop()}
-      </div>
-
-      {/* Preview/Summary */}
-      <div style={{
-        fontFamily: 'Fragment Mono, monospace',
-        fontSize: '10px',
-        color: '#4a6888',
-        lineHeight: '1.4',
-        display: '-webkit-box',
-        WebkitLineClamp: 2,
-        WebkitBoxOrient: 'vertical',
-        overflow: 'hidden',
-      }}>
-        {node.summary || '...'}
-      </div>
-    </div>
-  );
-}
-
-const GraphCanvas = () => {
-  const { 
-    selectedNode, 
-    selectNode, 
-    graphData, 
-  } = useApp();
-
-  const [pan, setPan] = useState({ x: 0, y: 0 });
-  const [isDragging, setIsDragging] = useState(false);
-  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
-
-  const handleMouseDown = (e: React.MouseEvent) => {
-    setIsDragging(true);
-    setDragStart({ x: e.clientX - pan.x, y: e.clientY - pan.y });
-  };
-
-  const handleMouseMove = (e: React.MouseEvent) => {
-    if (!isDragging) return;
-    setPan({
-      x: e.clientX - dragStart.x,
-      y: e.clientY - dragStart.y
+  // Track container dimensions for the WebGL canvas
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const obs = new ResizeObserver(entries => {
+      const { width, height } = entries[0].contentRect;
+      setDimensions({ width: Math.floor(width), height: Math.floor(height) });
     });
-  };
+    obs.observe(containerRef.current);
+    return () => obs.disconnect();
+  }, []);
 
-  const handleMouseUp = () => {
-    setIsDragging(false);
-  };
+  // Apply section-grouping forces after graph mounts
+  useEffect(() => {
+    if (!fgRef.current || !graphData?.nodes.length) return;
+    const fg = fgRef.current;
 
-  const { layoutNodes, layoutEdges, width, height } = useMemo(() => {
-    if (!graphData || !graphData.nodes.length) {
-      return { layoutNodes: [], layoutEdges: [], width: CANVAS_W, height: CANVAS_H };
-    }
-
-    const g = new dagre.graphlib.Graph();
-    g.setGraph({ rankdir: 'TB', ranksep: 80, nodesep: 100, marginx: 100, marginy: 100 });
-    g.setDefaultEdgeLabel(() => ({}));
-
-    // Filter nodes/edges based on active filters
-    // Currently, our graph might be small enough to just render everything, 
-    // but applying filters to the Dagre layout ensures a clean graph.
-    
-    // For simplicity, let's just lay them all out first.
-    graphData.nodes.forEach(node => {
-      g.setNode(node.id, { width: NODE_W, height: NODE_H });
+    // Custom X force: push each node toward its section's X target
+    fg.d3Force('section-x', (alpha: number) => {
+      (fg.graphData().nodes as any[]).forEach((node: any) => {
+        const layer = node.layer || getLayer(node.language || '');
+        const tx = layer === 'database' ? -520 : layer === 'backend' ? 0 : 520;
+        node.vx = ((node.vx as number) || 0) + (tx - ((node.x as number) || 0)) * alpha * 0.35;
+      });
     });
 
-    graphData.edges.forEach(edge => {
-      g.setEdge(edge.source, edge.target);
+    // Z-flatten force: keep graph in a 2.5-D plane
+    fg.d3Force('z-flatten', (alpha: number) => {
+      (fg.graphData().nodes as any[]).forEach((node: any) => {
+        node.vz = ((node.vz as number) || 0) - ((node.z as number) || 0) * alpha * 0.15;
+      });
     });
 
-    dagre.layout(g);
-
-    const layoutNodes = graphData.nodes.map(node => {
-      const pos = g.node(node.id);
-      return {
-        ...node,
-        x: pos.x - NODE_W / 2,
-        y: pos.y - NODE_H / 2
-      };
-    });
-
-    const layoutEdges = graphData.edges.map(edge => {
-      const source = g.node(edge.source);
-      const target = g.node(edge.target);
-      return {
-        ...edge,
-        sourcePos: { x: source.x - NODE_W / 2, y: source.y - NODE_H / 2 },
-        targetPos: { x: target.x - NODE_W / 2, y: target.y - NODE_H / 2 }
-      };
-    });
-
-    return { layoutNodes, layoutEdges, width: g.graph().width || CANVAS_W, height: g.graph().height || CANVAS_H };
+    fg.d3ReheatSimulation();
   }, [graphData]);
 
-  // Determine which nodes are connected to selected
-  const isConnected = (nodeId: string) => {
-    if (!selectedNode || !graphData) return true;
-    if (nodeId === selectedNode) return true;
-    return graphData.edges.some(e =>
-      (e.source === selectedNode && e.target === nodeId) ||
-      (e.target === selectedNode && e.source === nodeId)
-    );
-  };
+  // Selected + neighbor highlight set
+  const highlightedIds = useMemo<Set<string>>(() => {
+    if (!selectedNode || !graphData) return new Set();
+    const s = new Set<string>([selectedNode]);
+    graphData.edges.forEach(e => {
+      if (e.source === selectedNode) s.add(e.target);
+      if (e.target === selectedNode) s.add(e.source);
+    });
+    return s;
+  }, [selectedNode, graphData]);
 
-  const isEdgeConnected = (source: string, target: string) => {
-    if (!selectedNode) return true;
-    return source === selectedNode || target === selectedNode;
-  };
+  // Convert edges → links (the library uses "links" not "edges")
+  const fg3dData = useMemo(() => {
+    if (!graphData) return { nodes: [], links: [] };
+    const links = graphData.edges
+      .map(edge => ({
+        source:        edge.source,
+        target:        edge.target,
+        id:            edge.id,
+        edgeType:      (edge.data as any)?.type || 'FLOWS_TO',
+        confidence:    (edge.data as any)?.confidence ?? 0.5,
+        breakRisk:     (edge.data as any)?.break_risk || 'none',
+        inferredBy:    (edge.data as any)?.inferred_by || 'ast',
+        transformation:(edge.data as any)?.transformation || '',
+      }))
+      .filter(l => l.source && l.target);
+    return { nodes: graphData.nodes, links };
+  }, [graphData]);
 
+  // ── Custom Three.js node object ────────────────────────────────────────────
+  const nodeThreeObject = useCallback((node: any) => {
+    const color      = getLayerColor(node);
+    const isSelected = selectedNode === node.id;
+    const isHit      = highlightedIds.has(node.id);
+    const isDimmed   = highlightedIds.size > 0 && !isHit;
+    const isBoundary = node.is_boundary || false;
+    const severity   = (node as any).severity?.tier as string | undefined;
+
+    const group = new THREE.Group();
+
+    // Sphere radius varies by significance
+    const radius = isBoundary ? 7 : severity === 'CRITICAL' ? 9 : 5;
+    const mat = new THREE.MeshPhongMaterial({
+      color:             isSelected ? '#00e5b8' : color,
+      emissive:          isSelected ? '#007a60' : (isBoundary ? color : '#000000'),
+      emissiveIntensity: isSelected ? 0.7 : (isBoundary ? 0.25 : 0),
+      transparent: true,
+      opacity:     isDimmed ? 0.12 : 1,
+      shininess:   60,
+    });
+    group.add(new THREE.Mesh(new THREE.SphereGeometry(radius, 20, 20), mat));
+
+    // Outer ring for boundary / selected
+    if ((isBoundary || isSelected) && !isDimmed) {
+      const ringMat = new THREE.MeshBasicMaterial({
+        color, side: THREE.DoubleSide, transparent: true,
+        opacity: isSelected ? 0.85 : 0.3,
+      });
+      group.add(new THREE.Mesh(new THREE.RingGeometry(radius + 2, radius + 4, 32), ringMat));
+    }
+
+    // Red glow halo for CRITICAL severity
+    if (severity === 'CRITICAL' && !isDimmed) {
+      group.add(new THREE.Mesh(
+        new THREE.SphereGeometry(radius + 6, 16, 16),
+        new THREE.MeshBasicMaterial({ color: '#ff5733', transparent: true, opacity: 0.10, side: THREE.BackSide }),
+      ));
+    }
+
+    // Primary label sprite
+    const label = (node.name as string) || (node.id as string)?.split('::').pop() || '';
+    const sprite = new SpriteText(label);
+    sprite.color      = isSelected ? '#00e5b8' : (isDimmed ? '#1e3048' : '#e8f0fa');
+    sprite.textHeight = isSelected ? 9 : 5;
+    sprite.position.y = radius + 11;
+    group.add(sprite);
+
+    // Sub-label on selected / highlighted
+    if (isSelected || isHit) {
+      const sub = new SpriteText(
+        `[${node.type || '?'}] ${(node.file as string || '').split('/').pop()}`,
+      );
+      sub.color      = '#8da4bd';
+      sub.textHeight = 3.5;
+      sub.position.y = radius + 20;
+      group.add(sub);
+    }
+
+    return group;
+  }, [selectedNode, highlightedIds]);
+
+  // ── Edge styling ───────────────────────────────────────────────────────────
+  const linkColor = useCallback((link: any) => {
+    const srcId = typeof link.source === 'object' ? link.source.id : link.source;
+    const tgtId = typeof link.target === 'object' ? link.target.id : link.target;
+    const connected = !selectedNode || srcId === selectedNode || tgtId === selectedNode;
+    if (!connected) return 'rgba(20,35,55,0.12)';
+    if (link.breakRisk === 'high') return '#ff5733';
+    return EDGE_COLORS[link.edgeType as string] || '#2a4060';
+  }, [selectedNode]);
+
+  const linkWidth = useCallback((link: any) => {
+    const srcId = typeof link.source === 'object' ? link.source.id : link.source;
+    const tgtId = typeof link.target === 'object' ? link.target.id : link.target;
+    const connected = !selectedNode || srcId === selectedNode || tgtId === selectedNode;
+    if (link.breakRisk === 'high') return 1.8;
+    return connected ? 0.8 : 0.15;
+  }, [selectedNode]);
+
+  const linkDirectionalParticles = useCallback(
+    (link: any) => (link.breakRisk === 'high' ? 4 : 0),
+    [],
+  );
+
+  // ── Empty state ────────────────────────────────────────────────────────────
   if (!graphData || !graphData.nodes.length) {
-    return <div className="graph-canvas flex-1 flex items-center justify-center text-slate-500 font-mono">No graph data available. Run analysis first.</div>;
+    return (
+      <div
+        ref={containerRef}
+        className="flex-1 flex items-center justify-center"
+        style={{ background: '#04070d' }}
+      >
+        <div style={{
+          color: '#4a6888', fontFamily: 'Fragment Mono, monospace', fontSize: '13px',
+          textAlign: 'center', lineHeight: '1.8',
+        }}>
+          No graph data available.<br />
+          <span style={{ color: '#2a4060' }}>Run analysis to build the knowledge graph.</span>
+        </div>
+      </div>
+    );
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
   return (
     <div
-      className="graph-canvas flex-1 relative overflow-hidden"
-      style={{
-        width: '100%',
-        height: '100%',
-        minHeight: '400px',
-        cursor: isDragging ? 'grabbing' : 'grab'
-      }}
-      onMouseDown={handleMouseDown}
-      onMouseMove={handleMouseMove}
-      onMouseUp={handleMouseUp}
-      onMouseLeave={handleMouseUp}
+      ref={containerRef}
+      className="flex-1 relative overflow-hidden"
+      style={{ background: '#04070d', width: '100%', height: '100%', minHeight: 400 }}
     >
-      {/* Canvas controls */}
-      <div
-        className="absolute top-4 left-4 z-20 flex gap-1 p-1.5 rounded-[10px]"
-        style={{
-          background: 'rgba(7,13,22,0.85)',
-          backdropFilter: 'blur(16px)',
-          border: '1px solid var(--border-2-hex)',
-        }}
-      >
-        {['＋', '−', '⤢', '⛶'].map(icon => (
-          <button
-            key={icon}
-            className="w-8 h-8 flex items-center justify-center rounded-md text-[14px] cursor-pointer hover:bg-[var(--raised-hex)]"
-            style={{ color: 'var(--text-2-hex)' }}
+      {/* Section labels */}
+      <div className="absolute top-3 inset-x-0 z-20 flex justify-around px-4 pointer-events-none">
+        {([
+          { label: 'DATABASE',  color: '#f59e0b' },
+          { label: 'BACKEND',   color: '#a78bfa' },
+          { label: 'FRONTEND',  color: '#38bdf8' },
+        ] as const).map(s => (
+          <div
+            key={s.label}
+            style={{
+              fontFamily: 'Syne, sans-serif', fontSize: '10px', fontWeight: 700,
+              letterSpacing: '0.15em', color: s.color, opacity: 0.75,
+              background: `${s.color}12`, border: `1px solid ${s.color}30`,
+              padding: '3px 12px', borderRadius: '4px',
+            }}
           >
-            {icon}
-          </button>
+            {s.label}
+          </div>
         ))}
       </div>
 
-      {/* Draggable SVG Canvas */}
-      <div 
-        style={{
-          transform: `translate(${pan.x}px, ${pan.y}px)`,
-          width: width,
-          height: height,
-          position: 'absolute',
-          transformOrigin: '0 0'
-        }}
-      >
-        <svg
-          width="100%"
-          height="100%"
-          viewBox={`0 0 ${width} ${height}`}
-          style={{ position: 'absolute', top: 0, left: 0, overflow: 'visible' }}
-        >
-          <defs>
-            <marker id="arrow-critical" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-              <path d="M0,0 L0,6 L8,3 z" fill="#ff5733" />
-            </marker>
-            <marker id="arrow-normal" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-              <path d="M0,0 L0,6 L8,3 z" fill="#2a4060" />
-            </marker>
-            <marker id="arrow-high" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-                <path d="M0,0 L0,6 L8,3 z" fill="#f87171" />
-            </marker>
-            <filter id="glow-critical">
-              <feGaussianBlur stdDeviation="4" result="blur" />
-              <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
-            </filter>
-          </defs>
-
-          {/* Edges */}
-          {layoutEdges.map((edge) => {
-            const connected = isEdgeConnected(edge.source, edge.target);
-            const breakRisk = edge.data?.break_risk || '';
-            const isCritical = breakRisk === 'high';
-            const isHigh = breakRisk === 'high';
-            const showBroken = isCritical || isHigh;
-            const edgeInferredBy = edge.data?.inferred_by || '';
-            
-            let color = '#2a4060';
-            if (isCritical) color = '#ff5733';
-            else if (isHigh) color = '#f87171';
-
-            return (
-              <path
-                key={`${edge.source}-${edge.target}`}
-                d={getEdgePath(edge.sourcePos, edge.targetPos)}
-                stroke={color}
-                strokeWidth={showBroken ? 1.5 : 1}
-                fill="none"
-                className={isCritical ? 'edge-critical' : undefined}
-                filter={isCritical ? 'url(#glow-critical)' : undefined}
-                strokeDasharray={
-                  showBroken ? '10 5' :
-                  edgeInferredBy === 'naming' ? '6 3' :
-                  edgeInferredBy === 'llm' ? '2 4' : undefined
-                }
-                opacity={connected ? (showBroken ? 1 : 0.6) : 0.15}
-                markerEnd={`url(#arrow-${isCritical ? 'critical' : isHigh ? 'high' : 'normal'})`}
-              />
-            );
-          })}
-
-          {/* Nodes */}
-          {layoutNodes.map((node) => {
-            const incomingBreak = layoutEdges.find(e => e.target === node.id && (e.data?.break_risk === 'high'));
-            const tier = incomingBreak ? 'HIGH' : 'LOW';
-
-            return (
-              <foreignObject
-                key={node.id}
-                x={node.x}
-                y={node.y}
-                width={NODE_W}
-                height={NODE_H + 20}
-                style={{ overflow: 'visible' }}
-              >
-                <NodeCard
-                  node={node}
-                  selected={selectedNode === node.id}
-                  dimmed={!isConnected(node.id)}
-                  onClick={() => selectNode(node.id)}
-                  severityTier={tier as any}
-                />
-              </foreignObject>
-            );
-          })}
-        </svg>
+      {/* Controls hint */}
+      <div className="absolute top-12 right-4 z-20 pointer-events-none"
+        style={{ fontFamily: 'Fragment Mono, monospace', fontSize: '9px', color: '#2a4060' }}>
+        drag · scroll to zoom · click to inspect
       </div>
 
-      {/* Edge type legend */}
+      {/* Edge legend */}
       <div
-        className="absolute bottom-4 left-4 z-20 p-4 rounded-[10px] w-[200px]"
-        style={{
-          background: 'rgba(7,13,22,0.85)',
-          backdropFilter: 'blur(16px)',
-          border: '1px solid var(--border-2-hex)',
-        }}
+        className="absolute bottom-4 left-4 z-20 p-3 rounded-xl"
+        style={{ background: 'rgba(7,13,22,0.88)', backdropFilter: 'blur(16px)', border: '1px solid rgba(255,255,255,0.05)' }}
       >
-        <div className="font-syne font-semibold text-[10px] tracking-[0.12em] mb-3" style={{ color: 'var(--text-3-hex)' }}>EDGE TYPES</div>
-        <div className="space-y-2">
-          <div className="flex items-center gap-3">
-            <svg width="36" height="2"><line x1="0" y1="1" x2="36" y2="1" stroke="var(--text-2-hex)" strokeWidth="1.5" /></svg>
-            <span className="font-mono text-[12px]" style={{ color: 'var(--text-2-hex)' }}>AST Proven</span>
-          </div>
-          <div className="flex items-center gap-3">
-            <svg width="36" height="2"><line x1="0" y1="1" x2="36" y2="1" stroke="var(--text-2-hex)" strokeWidth="1.5" strokeDasharray="6 3" /></svg>
-            <span className="font-mono text-[12px]" style={{ color: 'var(--text-2-hex)' }}>Naming Matched</span>
-          </div>
-          <div className="flex items-center gap-3">
-            <svg width="36" height="2"><line x1="0" y1="1" x2="36" y2="1" stroke="var(--text-2-hex)" strokeWidth="1.5" strokeDasharray="2 4" /></svg>
-            <span className="font-mono text-[12px]" style={{ color: 'var(--text-2-hex)' }}>LLM Inferred</span>
-          </div>
+        <div style={{ fontFamily: 'Syne, sans-serif', fontSize: '9px', fontWeight: 600,
+          letterSpacing: '0.12em', color: '#4a6888', marginBottom: '8px' }}>
+          RELATIONSHIP TYPES
         </div>
+        {([
+          { color: '#00e5b8', label: 'MAPS_TO — SQL → Python' },
+          { color: '#38bdf8', label: 'SERIALIZES_TO — Python → TS' },
+          { color: '#34d399', label: 'RENDERS — TS → React' },
+          { color: '#818cf8', label: 'EXPOSES_AS — route API' },
+          { color: '#ff5733', label: 'CRITICAL BREAK' },
+          { color: '#2a4060', label: 'AST / IMPORT' },
+        ] as const).map(e => (
+          <div key={e.label} style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '3px' }}>
+            <div style={{ width: '18px', height: '2px', background: e.color, borderRadius: '1px' }} />
+            <span style={{ fontFamily: 'Fragment Mono, monospace', fontSize: '9px', color: '#8da4bd' }}>
+              {e.label}
+            </span>
+          </div>
+        ))}
       </div>
+
+      {/* Stats badge */}
+      <div className="absolute bottom-4 right-4 z-20"
+        style={{ fontFamily: 'Fragment Mono, monospace', fontSize: '9px', color: '#4a6888',
+          background: 'rgba(7,13,22,0.85)', border: '1px solid rgba(255,255,255,0.05)',
+          padding: '4px 10px', borderRadius: '6px' }}>
+        {graphData.nodes.length} nodes · {graphData.edges.length} edges
+      </div>
+
+      {/* 3D Force Graph */}
+      <ForceGraph3D
+        ref={fgRef}
+        graphData={fg3dData}
+        width={dimensions.width}
+        height={dimensions.height}
+        backgroundColor="#04070d"
+        nodeThreeObject={nodeThreeObject}
+        nodeThreeObjectExtend={false}
+        linkColor={linkColor}
+        linkWidth={linkWidth}
+        linkOpacity={0.65}
+        linkDirectionalArrowLength={3.5}
+        linkDirectionalArrowRelPos={1}
+        linkDirectionalArrowColor={linkColor}
+        linkDirectionalParticles={linkDirectionalParticles}
+        linkDirectionalParticleColor={() => '#ff5733'}
+        linkDirectionalParticleSpeed={0.005}
+        linkDirectionalParticleWidth={1.5}
+        onNodeClick={(node: any) => selectNode(node.id)}
+        onBackgroundClick={() => selectNode(null)}
+        d3AlphaDecay={0.025}
+        d3VelocityDecay={0.3}
+        cooldownTicks={250}
+        showNavInfo={false}
+      />
     </div>
   );
 };

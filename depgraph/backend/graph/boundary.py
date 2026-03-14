@@ -80,15 +80,35 @@ def detect_boundary_nodes(all_file_nodes: list) -> list:
     return boundary_nodes
 
 
-def create_boundary_pairs(boundary_nodes: list) -> list:
+def _name_similarity(a: str, b: str) -> float:
+    """
+    Token-level Jaccard similarity between two identifiers after
+    splitting on underscores and camelCase boundaries.  Returns 0.0–1.0.
+    """
+    def tokenize(name: str) -> set:
+        s = re.sub(r'([A-Z])', r'_\1', name)
+        return set(t.lower() for t in re.split(r'[_\s]+', s) if len(t) > 1)
+
+    ta, tb = tokenize(a), tokenize(b)
+    union = ta | tb
+    if not union:
+        return 0.0
+    return len(ta & tb) / len(union)
+
+
+def create_boundary_pairs(boundary_nodes: list, max_pairs: int = 25) -> list:
     """
     Pair boundary nodes across adjacent language layers.
     Language adjacency: sql → python → typescript → react
-    Only adjacent layers are paired to scope LLM calls.
+
+    To stay within 3-4 total LLM calls the total number of pairs is capped at
+    *max_pairs*.  When capping is needed we keep pairs with the highest
+    name-similarity score so the most-likely real connections are preserved.
     """
     lang_order = ["sql", "python", "typescript", "react", "javascript"]
-    pairs = []
 
+    # Build all candidate pairs, scoring each by name similarity
+    scored: list[tuple[float, object]] = []
     for i in range(len(lang_order) - 1):
         emitter_lang = lang_order[i]
         receiver_lang = lang_order[i + 1]
@@ -96,15 +116,26 @@ def create_boundary_pairs(boundary_nodes: list) -> list:
         receivers = [n for n in boundary_nodes if n.language == receiver_lang]
         for e in emitters:
             for r in receivers:
-                pairs.append(BoundaryPair(
+                score = _name_similarity(e.name, r.name)
+                pair = BoundaryPair(
                     emitter=e,
                     receiver=r,
                     emitter_language=emitter_lang,
                     receiver_language=receiver_lang,
                     signal=e.metadata.get("boundary_signal", "sql_table")
-                ))
+                )
+                scored.append((score, pair))
+
+    # Sort descending by similarity so we keep the best candidates when capping
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    pairs = [pair for _, pair in scored[:max_pairs]]
 
     total_nodes = len(flatten_tree(boundary_nodes))
-    print(f"  Boundary Zone Detector: {len(pairs)} pairs "
-          f"(LLM calls reduced from ~{total_nodes} nodes to {len(pairs)} pairs)")
+    skipped = max(0, len(scored) - len(pairs))
+    print(
+        f"  Boundary Zone Detector: {len(pairs)} pairs selected "
+        f"(from {len(scored)} candidates, {skipped} low-similarity pairs skipped, "
+        f"~{total_nodes} total boundary nodes)"
+    )
     return pairs
