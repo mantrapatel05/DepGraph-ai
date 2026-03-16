@@ -106,19 +106,18 @@ const LeftSidebar = () => {
     
     // Compute severity per node from edges (target side)
     const nodeSeverity: Record<string, boolean> = {};
-    graphData.edges.forEach((e: any) => {
-        const breakRisk = e.data?.break_risk;
-        // Backend uses lowercase: 'high', 'critical'
-        if (breakRisk === 'high' || breakRisk === 'critical' || breakRisk === 'CRITICAL' || breakRisk === 'HIGH') {
-            nodeSeverity[e.target] = true;
-        }
+    graphData.edges.forEach(e => {
+      const risk = (e.data as any)?.break_risk;
+      if (risk === 'HIGH' || risk === 'CRITICAL' || risk === 'high' || risk === 'critical') {
+        nodeSeverity[e.target] = true;
+      }
     });
 
     graphData.nodes.forEach(n => {
         if (nodeSeverity[n.id]) breakingCount++;
     });
 
-    const aiEdges = graphData.edges.filter((e: any) => e.data?.inferred_by === 'llm').length;
+    const aiEdges = graphData.edges.filter(e => (e.data as any)?.inferred_by === 'llm').length;
 
     // Group nodes by file path
     const fileMap = new Map<string, FileItem[]>();
@@ -168,7 +167,7 @@ const LeftSidebar = () => {
   }, [graphData, filterBreakingOnly, search]);
 
   return (
-    <div className="w-[280px] h-full shrink-0 flex flex-col border-r" style={{ background: 'var(--base-hex)', borderColor: 'var(--border-1-hex)' }}>
+    <div className="w-[280px] shrink-0 flex flex-col border-r overflow-y-auto" style={{ background: 'var(--base-hex)', borderColor: 'var(--border-1-hex)' }}>
       {/* Search */}
       <div className="p-3">
         <div className="relative">

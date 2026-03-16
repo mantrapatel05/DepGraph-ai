@@ -1,15 +1,11 @@
 import { motion, AnimatePresence } from 'framer-motion';
 import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
 import { useApp } from '@/context/AppContext';
-import { useAuth } from '@/context/AuthContext';
 
 type AnalysisState = 'idle' | 'running' | 'complete';
 
 const TopBar = () => {
   const { analysisComplete, analysisRunning, startAnalysisStream, repoUrl, graphData } = useApp();
-  const { username, logout } = useAuth();
-  const navigate = useNavigate();
   const [btnState, setBtnState] = useState<AnalysisState>('idle');
 
   useEffect(() => {
@@ -23,11 +19,9 @@ const TopBar = () => {
     startAnalysisStream(repoUrl || '.');
   };
 
-  const breakingCount = graphData?.edges.filter((e: any) => {
-    const risk = e.data?.break_risk;
-    return risk === 'high' || risk === 'critical' || risk === 'HIGH' || risk === 'CRITICAL';
-  }).length || 0;
-  const languageCount = new Set(graphData?.nodes.map((n: any) => n.language)).size;
+  const breakingCount =
+    graphData?.edges.filter(e => (e.data as any)?.break_risk === 'high').length || 0;
+  const languageCount = graphData ? new Set(graphData.nodes.map(n => n.language)).size : 0;
 
   return (
     <div
@@ -44,12 +38,11 @@ const TopBar = () => {
 
       {/* Center */}
       <div className="absolute left-1/2 -translate-x-1/2">
-        {analysisComplete ? (
+        {analysisComplete && graphData ? (
           <span className="font-mono text-[12px]" style={{ color: 'var(--text-3-hex)' }}>
-            <span style={{ color: breakingCount > 0 ? 'var(--orange-hex)' : 'var(--teal-hex)' }}>
-              {breakingCount > 0 ? '⚠' : '✓'}
-            </span>{' '}
-            Analysis complete — {breakingCount > 0 ? `${breakingCount} breaking changes` : '0 breaking changes'} across {languageCount} language{languageCount !== 1 ? 's' : ''}
+            <span style={{ color: 'var(--teal-hex)' }}>✓</span>{' '}
+            Analysis complete — {breakingCount} breaking changes across {languageCount || 1}{' '}
+            {languageCount === 1 ? 'language' : 'languages'}
           </span>
         ) : (
           <div className="flex items-center gap-2">
@@ -120,23 +113,6 @@ const TopBar = () => {
         >
           ⚙
         </motion.button>
-
-        {username && (
-          <div className="flex items-center gap-1.5 ml-1">
-            <span className="font-mono text-[11px] px-2 py-1 rounded-md" style={{ background: 'var(--surface-hex)', color: 'var(--text-3-hex)' }}>
-              {username}
-            </span>
-            <motion.button
-              whileHover={{ scale: 1.02 }}
-              whileTap={{ scale: 0.98 }}
-              onClick={() => { logout(); navigate('/login'); }}
-              className="font-mono text-[11px] px-2 py-1 rounded-md border cursor-pointer"
-              style={{ borderColor: 'var(--border-2-hex)', color: 'var(--text-3-hex)' }}
-            >
-              Sign out
-            </motion.button>
-          </div>
-        )}
       </div>
     </div>
   );

@@ -1,688 +1,361 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import React, { useMemo, useCallback, useState } from 'react';
-import {
-  ReactFlow,
-  Background,
-  Controls,
-  Handle,
-  Position,
-  type NodeTypes,
-  type EdgeTypes,
-  BaseEdge,
-  getBezierPath,
-  type EdgeProps,
-  BackgroundVariant,
-  Panel,
-  MiniMap,
-} from '@xyflow/react';
-import '@xyflow/react/dist/style.css';
-import dagre from '@dagrejs/dagre';
+// @ts-nocheck  — react-force-graph-3d + three-spritetext lack complete TS types
+import React, {
+  useRef,
+  useEffect,
+  useMemo,
+  useCallback,
+  useState,
+} from 'react';
+import ForceGraph3D from 'react-force-graph-3d';
+import { forceX } from 'd3-force';
+
+// d3-force doesn't export forceZ; replicate it as a simple Z-attractor
+function forceZ(targetZ: number) {
+  let strength = 0.1;
+  let nodes: any[] = [];
+  function force() {
+    for (const node of nodes) {
+      node.vz = (node.vz || 0) + (targetZ - (node.z || 0)) * strength;
+    }
+  }
+  force.initialize = (n: any[]) => { nodes = n; };
+  force.strength = (s: number) => { strength = s; return force; };
+  return force;
+}
+import SpriteText from 'three-spritetext';
+import * as THREE from 'three';
 import { useApp } from '@/context/AppContext';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const ZONE: Record<string, { color: string; label: string }> = {
-  database: { color: '#f59e0b', label: 'DATABASE'  },
-  backend:  { color: '#a78bfa', label: 'BACKEND'   },
-  frontend: { color: '#38bdf8', label: 'FRONTEND'  },
+const LAYER_COLORS: Record<string, string> = {
+  database: '#f59e0b',
+  backend:  '#a78bfa',
+  frontend: '#38bdf8',
 };
 
-const NODE_W  = 200;
-const NODE_H  = 96;
-
-// Target x-center for each zone after dagre layout
-const ZONE_TARGET_X: Record<string, number> = { database: 220, backend: 860, frontend: 1520 };
-const ZONE_BAND_W   = 480;   // max spread within a zone column
-const ZONE_BG_PAD   = 36;
-
-const CHAIN_EDGE_TYPES = new Set([
-  // current backend names
-  'MAPS_TO', 'SERIALIZES_TO', 'RENDERS', 'FLOWS_TO', 'EXPOSES_AS', 'IMPORTS',
-  // legacy names (older graphs)
-  'ORM_MAP', 'CONVENTION_MAP', 'SCHEMA_MAP',
-]);
-
-const EDGE_COLOR: Record<string, string> = {
-  // current
-  MAPS_TO:        '#00e5b8',
-  SERIALIZES_TO:  '#38bdf8',
-  RENDERS:        '#34d399',
-  FLOWS_TO:       '#7c3aed',
-  EXPOSES_AS:     '#818cf8',
-  IMPORTS:        '#64748b',
-  // legacy compat
-  ORM_MAP:        '#00e5b8',
-  CONVENTION_MAP: '#38bdf8',
-  SCHEMA_MAP:     '#a78bfa',
+const LANG_TO_LAYER: Record<string, string> = {
+  sql:        'database',
+  python:     'backend',
+  typescript: 'frontend',
+  react:      'frontend',
+  javascript: 'frontend',
 };
 
-const TYPE_LABEL: Record<string, string> = {
-  column: 'Column', table: 'Table', variable: 'Variable',
-  function: 'Method', class: 'Class', interface: 'Interface',
-  route: 'Route', file: 'File',
+const EDGE_COLORS: Record<string, string> = {
+  MAPS_TO:           '#00e5b8',
+  SERIALIZES_TO:     '#38bdf8',
+  EXPOSES_AS:        '#818cf8',
+  RENDERS:           '#34d399',
+  FLOWS_TO:          '#7c3aed',
+  TRANSFORMS:        '#f59e0b',
+  BREAKS_IF_RENAMED: '#ff5733',
+  CALLS:             '#4a6888',
+  IMPORTS:           '#2a4060',
 };
 
-const LANG_LAYER: Record<string, string> = {
-  sql: 'database', python: 'backend',
-  typescript: 'frontend', react: 'frontend', javascript: 'frontend',
-};
-
-const LAYER_ORDER = ['database', 'backend', 'frontend'];
-
-function nodeLayer(n: any): string {
-  return n?.layer || LANG_LAYER[n?.language || ''] || 'backend';
+function getLayer(lang: string): string {
+  return LANG_TO_LAYER[lang] || 'backend';
 }
 
-// ─── Dagre layout with zone snapping ─────────────────────────────────────────
-
-function buildLayout(graphNodes: any[], graphEdges: any[]) {
-  if (!graphNodes.length) return { rfNodes: [], rfEdges: [] };
-
-  // Only show nodes that appear in at least one edge
-  const connectedIds = new Set<string>();
-  graphEdges.forEach(e => { connectedIds.add(e.source); connectedIds.add(e.target); });
-  const nodes = graphNodes.filter(n => connectedIds.has(n.id));
-  if (!nodes.length) return { rfNodes: [], rfEdges: [] };
-
-  // Run dagre to get organic topology-based positions
-  const g = new dagre.graphlib.Graph();
-  g.setDefaultEdgeLabel(() => ({}));
-  g.setGraph({ rankdir: 'LR', ranksep: 420, nodesep: 60, marginx: 60, marginy: 60 });
-
-  nodes.forEach(n => g.setNode(n.id, { width: NODE_W, height: NODE_H }));
-
-  const seenEdge = new Set<string>();
-  graphEdges.forEach(e => {
-    if (!g.hasNode(e.source) || !g.hasNode(e.target)) return;
-    const k = `${e.source}|||${e.target}`;
-    if (!seenEdge.has(k)) { seenEdge.add(k); g.setEdge(e.source, e.target); }
-  });
-
-  dagre.layout(g);
-
-  // Collect dagre x values per zone so we can normalize
-  const zoneXBucket: Record<string, number[]> = {};
-  nodes.forEach(n => {
-    const pos = g.node(n.id);
-    if (!pos) return;
-    (zoneXBucket[nodeLayer(n)] ??= []).push(pos.x);
-  });
-
-  // Map each node's dagre x → zone-band x
-  const rfNodes: any[] = [];
-  const layerBounds: Record<string, { minX: number; maxX: number; minY: number; maxY: number }> = {};
-
-  nodes.forEach(n => {
-    const pos = g.node(n.id);
-    if (!pos) return;
-    const layer  = nodeLayer(n);
-    const xs     = zoneXBucket[layer] ?? [];
-    const dMin   = xs.length ? Math.min(...xs) : pos.x;
-    const dMax   = xs.length ? Math.max(...xs) : pos.x;
-    const dSpan  = dMax > dMin ? dMax - dMin : 1;
-    const norm   = (pos.x - dMin) / dSpan - 0.5;           // -0.5 … +0.5
-    const center = ZONE_TARGET_X[layer] ?? 680;
-    const finalX = center + norm * ZONE_BAND_W - NODE_W / 2;
-    const finalY = pos.y - NODE_H / 2;
-
-    rfNodes.push({
-      id: n.id,
-      type: 'codeNode',
-      position: { x: finalX, y: finalY },
-      data: { ...n, _layer: layer },
-      style: { width: NODE_W },
-      zIndex: 10,
-    });
-
-    const b = layerBounds[layer] ??= { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
-    b.minX = Math.min(b.minX, finalX);
-    b.maxX = Math.max(b.maxX, finalX + NODE_W);
-    b.minY = Math.min(b.minY, finalY);
-    b.maxY = Math.max(b.maxY, finalY + NODE_H);
-  });
-
-  // Zone backgrounds
-  const bgNodes = Object.entries(ZONE)
-    .filter(([key]) => layerBounds[key])
-    .map(([key, zone]) => {
-      const b = layerBounds[key];
-      const w = b.maxX - b.minX + ZONE_BG_PAD * 4;
-      const h = b.maxY - b.minY + ZONE_BG_PAD * 4;
-      return {
-        id: `zone-bg-${key}`,
-        type: 'zoneBg',
-        position: { x: b.minX - ZONE_BG_PAD * 2, y: b.minY - ZONE_BG_PAD * 2 },
-        data: { color: zone.color, width: w, height: h, label: zone.label },
-        selectable: false, draggable: false, connectable: false,
-        zIndex: -20,
-        style: { width: w, height: h, pointerEvents: 'none' },
-      };
-    });
-
-  // Edges
-  const posIds = new Set(rfNodes.map(n => n.id));
-  const rfEdges = graphEdges
-    .filter(e => posIds.has(e.source) && posIds.has(e.target))
-    .map(e => ({
-      id: e.id,
-      source: e.source,
-      target: e.target,
-      type: 'depEdge',
-      animated: e.data?.break_risk === 'high',
-      zIndex: 20,
-      data: {
-        edgeType:    e.data?.type        || 'FLOWS_TO',
-        breakRisk:   e.data?.break_risk  || 'none',
-        inferredBy:  e.data?.inferred_by || 'ast',
-        confidence:  e.data?.confidence  ?? 0.5,
-        isChainEdge: CHAIN_EDGE_TYPES.has(e.data?.type),
-      },
-    }));
-
-  return { rfNodes: [...bgNodes, ...rfNodes], rfEdges };
+function getLayerColor(node: any): string {
+  const layer = node.layer || getLayer(node.language || '');
+  return LAYER_COLORS[layer] || '#4a6888';
 }
 
-// ─── Trail computation: BFS forward + backward from a clicked node ────────────
-
-interface Trail {
-  nodeIds:  Set<string>;
-  edgeIds:  Set<string>;
-  // Ordered chain: upstream nodes → selected → downstream nodes
-  chain:    string[];
-}
-
-function computeTrail(nodeId: string, nodes: any[], edges: any[]): Trail {
-  const outgoing = new Map<string, string[]>();
-  const incoming = new Map<string, string[]>();
-  for (const e of edges) {
-    (outgoing.get(e.source) ?? outgoing.set(e.source, []).get(e.source)!).push(e.target);
-    (incoming.get(e.target) ?? incoming.set(e.target, []).get(e.target)!).push(e.source);
-  }
-
-  const bfs = (start: string, adj: Map<string, string[]>) => {
-    const visited = new Set<string>();
-    const queue = [start];
-    while (queue.length) {
-      const cur = queue.shift()!;
-      for (const next of adj.get(cur) ?? []) {
-        if (!visited.has(next)) { visited.add(next); queue.push(next); }
-      }
-    }
-    return visited;
-  };
-
-  const downstream = bfs(nodeId, outgoing);
-  const upstream   = bfs(nodeId, incoming);
-  const nodeIds    = new Set([nodeId, ...upstream, ...downstream]);
-
-  const edgeIds = new Set(
-    edges.filter(e => nodeIds.has(e.source) && nodeIds.has(e.target)).map(e => e.id)
-  );
-
-  // Build ordered chain: sort by layer, prefer shortest direct path
-  const nodeMap = new Map(nodes.map(n => [n.id, n]));
-  const chain = LAYER_ORDER.flatMap(layer =>
-    [...nodeIds]
-      .filter(id => nodeLayer(nodeMap.get(id)) === layer)
-      .sort((a, b) => {
-        // prefer cross-language nodes first
-        const aOut = (outgoing.get(a) ?? []).filter(t => nodeLayer(nodeMap.get(t)) !== layer).length;
-        const bOut = (outgoing.get(b) ?? []).filter(t => nodeLayer(nodeMap.get(t)) !== layer).length;
-        return bOut - aOut;
-      })
-      .slice(0, 3) // max 3 per layer for readability
-  );
-
-  return { nodeIds, edgeIds, chain };
-}
-
-// ─── Zone background ─────────────────────────────────────────────────────────
-
-const ZoneBg = ({ data }: any) => (
-  <div style={{
-    width: data.width, height: data.height,
-    background: `${data.color}09`,
-    border: `1.5px solid ${data.color}30`,
-    borderRadius: 18, pointerEvents: 'none',
-    boxShadow: `inset 0 0 80px ${data.color}07, 0 0 0 1px ${data.color}10`,
-  }}>
-    <div style={{
-      position: 'absolute', top: 12, left: 0, right: 0, textAlign: 'center',
-      fontFamily: 'Syne, sans-serif', fontSize: 10, fontWeight: 800,
-      letterSpacing: '0.22em', color: `${data.color}70`,
-    }}>
-      {data.label}
-    </div>
-  </div>
-);
-
-// ─── Code node ────────────────────────────────────────────────────────────────
-
-const CodeNode = ({ data, selected }: any) => {
-  const layer   = data._layer || nodeLayer(data);
-  const color   = ZONE[layer]?.color || '#4a6888';
-  const tier    = data.severity?.tier;
-  const isCrit  = tier === 'CRITICAL' || tier === 'HIGH';
-  const label   = TYPE_LABEL[data.type] || data.type || '';
-  const file    = (data.file || '').split(/[/\\]/).pop() || '';
-
-  const preview = useMemo(() => {
-    const src = (data.source_lines || '').trim();
-    if (src) return src.split('\n').filter((l: string) => l.trim()).slice(0, 3).join('\n');
-    if (data.language === 'sql'        && data.type === 'column')   return `${data.name} VARCHAR(255)`;
-    if (data.language === 'sql'        && data.type === 'table')    return `TABLE ${data.name} (...)`;
-    if (data.language === 'python'     && data.type === 'class')    return `class ${data.name}:`;
-    if (data.language === 'python'     && data.type === 'function') return `def ${data.name}(self):`;
-    if (data.language === 'python'     && data.type === 'variable') return `${data.name} = Column(...)`;
-    if (data.language === 'typescript' && data.type === 'variable') return `${data.name}: string;`;
-    if (data.language === 'typescript' && data.type === 'class')    return `interface ${data.name} {`;
-    if (data.language === 'react'      && data.type === 'variable') return `{data.${data.name}}`;
-    return data.name;
-  }, [data]);
-
-  return (
-    <div style={{
-      width: NODE_W,
-      background: selected ? 'rgba(0,229,184,0.1)' : isCrit ? 'rgba(255,87,51,0.07)' : 'rgba(7,14,26,0.97)',
-      border: `1.5px solid ${selected ? '#00e5b8' : isCrit ? '#ff573388' : color + '44'}`,
-      borderRadius: 10, overflow: 'hidden',
-      fontFamily: 'Fragment Mono, monospace',
-      boxShadow: selected
-        ? `0 0 24px rgba(0,229,184,0.25), 0 2px 12px rgba(0,0,0,0.6)`
-        : isCrit
-        ? `0 0 16px rgba(255,87,51,0.15)`
-        : `0 2px 8px rgba(0,0,0,0.4)`,
-      cursor: 'pointer',
-      transition: 'box-shadow 0.15s, border-color 0.15s',
-    }}>
-      <Handle type="target" position={Position.Left}
-        style={{ background: color, width: 9, height: 9, border: `2px solid #07080e`, left: -6 }} />
-      <Handle type="source" position={Position.Right}
-        style={{ background: color, width: 9, height: 9, border: `2px solid #07080e`, right: -6 }} />
-
-      <div style={{ height: 3, background: `linear-gradient(90deg, ${color}, ${color}66)` }} />
-
-      <div style={{
-        background: `${color}10`, borderBottom: `1px solid ${color}20`,
-        padding: '4px 10px', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-      }}>
-        <span style={{ color: `${color}aa`, fontSize: 9, letterSpacing: '0.04em',
-          maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {file}
-        </span>
-        <span style={{ color: 'rgba(255,255,255,0.18)', fontSize: 8 }}>:{data.line_start}</span>
-      </div>
-
-      <div style={{
-        padding: '7px 10px 3px',
-        color: selected ? '#00e5b8' : '#e8f4ff',
-        fontSize: 13, fontWeight: 700,
-        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-      }}>
-        {data.name}
-      </div>
-
-      <div style={{
-        margin: '0 8px 4px',
-        background: 'rgba(0,0,0,0.28)', border: '1px solid rgba(255,255,255,0.04)',
-        borderRadius: 5, padding: '3px 7px',
-        fontSize: 9, color: '#5a8aa8',
-        whiteSpace: 'pre', overflow: 'hidden', maxHeight: 28, lineHeight: 1.5,
-      }}>
-        {preview}
-      </div>
-
-      <div style={{ padding: '2px 10px 5px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <span style={{ fontSize: 9, color: `${color}80`, letterSpacing: '0.05em' }}>{label}</span>
-        {isCrit ? (
-          <span style={{ fontSize: 8, fontWeight: 800, color: '#ff5733',
-            background: 'rgba(255,87,51,0.12)', border: '1px solid rgba(255,87,51,0.3)',
-            borderRadius: 3, padding: '1px 5px', letterSpacing: '0.08em' }}>CRITICAL</span>
-        ) : data.is_boundary ? (
-          <span style={{ fontSize: 8, fontWeight: 700, color, background: `${color}15`,
-            border: `1px solid ${color}30`, borderRadius: 3, padding: '1px 5px',
-            letterSpacing: '0.05em' }}>BOUNDARY</span>
-        ) : null}
-      </div>
-    </div>
-  );
-};
-
-// ─── Edge ─────────────────────────────────────────────────────────────────────
-
-const DepEdge = ({ sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, data, selected }: EdgeProps) => {
-  const [path] = getBezierPath({ sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, curvature: 0.3 });
-  const edgeType   = (data as any)?.edgeType   || 'FLOWS_TO';
-  const breakRisk  = (data as any)?.breakRisk  || 'none';
-  const inferredBy = (data as any)?.inferredBy || 'ast';
-  const isChain    = (data as any)?.isChainEdge as boolean;
-  const isBreaking = breakRisk === 'high';
-  const isTrail    = (data as any)?.isTrail as boolean;
-
-  const color = isBreaking ? '#ff5733' : isTrail ? '#00e5b8' : isChain ? (EDGE_COLOR[edgeType] || '#38bdf8') : '#1e3248';
-  const dash  = inferredBy === 'llm' ? '4 5' : inferredBy === 'naming' ? '8 4' : undefined;
-  const w     = selected || isTrail ? 2.5 : isBreaking ? 2 : isChain ? 1.5 : 0.7;
-  const op    = selected ? 1 : isTrail ? 0.9 : isBreaking ? 0.85 : isChain ? 0.5 : 0.2;
-
-  return (
-    <>
-      {(isBreaking || isTrail) && (
-        <BaseEdge path={path} style={{ stroke: color, strokeWidth: 12, opacity: 0.06 }} />
-      )}
-      <BaseEdge path={path} style={{ stroke: color, strokeWidth: w, strokeDasharray: dash, opacity: op }} />
-    </>
-  );
-};
-
-// ─── Trail panel ──────────────────────────────────────────────────────────────
-
-const TrailPanel = ({ trail, nodes, edges, onClose }: {
-  trail: Trail; nodes: any[]; edges: any[]; onClose: () => void;
-}) => {
-  const nodeMap  = useMemo(() => new Map(nodes.map(n => [n.id, n])), [nodes]);
-  const edgeMap  = useMemo(() => {
-    const m = new Map<string, any[]>();
-    edges.forEach(e => { (m.get(e.source) ?? m.set(e.source, []).get(e.source)!).push(e); });
-    return m;
-  }, [edges]);
-
-  const chain = trail.chain;
-
-  return (
-    <div style={{
-      position: 'absolute', bottom: 16, left: '50%', transform: 'translateX(-50%)',
-      background: 'rgba(5,10,18,0.97)', backdropFilter: 'blur(18px)',
-      border: '1px solid rgba(0,229,184,0.25)', borderRadius: 12,
-      padding: '12px 20px 14px', zIndex: 100,
-      maxWidth: 'calc(100% - 32px)', overflow: 'hidden',
-      boxShadow: '0 4px 32px rgba(0,229,184,0.12)',
-    }}>
-      {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-        <span style={{ fontFamily: 'Syne, sans-serif', fontSize: 9, fontWeight: 700,
-          letterSpacing: '0.16em', color: '#00e5b888' }}>
-          VARIABLE TRAIL &nbsp;·&nbsp; {trail.nodeIds.size} nodes
-        </span>
-        <button onClick={onClose} style={{
-          background: 'none', border: 'none', color: 'rgba(255,255,255,0.3)',
-          cursor: 'pointer', fontSize: 13, padding: '0 4px', lineHeight: 1,
-        }}>✕</button>
-      </div>
-
-      {/* Chain */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 0, flexWrap: 'nowrap', overflowX: 'auto', overflowY: 'hidden' }}>
-        {chain.map((id, idx) => {
-          const n     = nodeMap.get(id);
-          if (!n) return null;
-          const layer = nodeLayer(n);
-          const color = ZONE[layer]?.color || '#4a6888';
-          // Find edge to next node in chain
-          const nextId  = chain[idx + 1];
-          const linkEdge = nextId ? edgeMap.get(id)?.find(e => e.target === nextId) : null;
-          const etype   = linkEdge?.data?.type || '';
-
-          return (
-            <React.Fragment key={id}>
-              {/* Node chip */}
-              <div style={{
-                background: `${color}12`, border: `1px solid ${color}40`,
-                borderRadius: 7, padding: '5px 10px', flexShrink: 0,
-                fontFamily: 'Fragment Mono, monospace',
-              }}>
-                <div style={{ fontSize: 7, color: `${color}88`, letterSpacing: '0.1em', marginBottom: 2 }}>
-                  {ZONE[layer]?.label}
-                </div>
-                <div style={{ fontSize: 11, fontWeight: 700, color: '#e8f4ff',
-                  maxWidth: 130, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {n.name}
-                </div>
-                <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.25)', marginTop: 2 }}>
-                  {TYPE_LABEL[n.type] || n.type}
-                </div>
-              </div>
-
-              {/* Arrow */}
-              {nextId && (
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center',
-                  padding: '0 4px', flexShrink: 0 }}>
-                  <div style={{ fontSize: 7, color: EDGE_COLOR[etype] || '#3a5a78',
-                    letterSpacing: '0.06em', marginBottom: 2, whiteSpace: 'nowrap' }}>
-                    {etype}
-                  </div>
-                  <div style={{ color: '#2a4060', fontSize: 13 }}>→</div>
-                </div>
-              )}
-            </React.Fragment>
-          );
-        })}
-      </div>
-    </div>
-  );
-};
-
-// ─── Node / edge type maps ────────────────────────────────────────────────────
-
-const nodeTypes: NodeTypes = { codeNode: CodeNode, zoneBg: ZoneBg } as any;
-const edgeTypes: EdgeTypes = { depEdge: DepEdge as any };
-
-// ─── Main canvas ──────────────────────────────────────────────────────────────
+// ─── 3-D Knowledge Graph Canvas ──────────────────────────────────────────────
 
 const GraphCanvas: React.FC = () => {
-  const { graphData, selectedNode, selectNode, filterBreakingOnly, filterHideLowConf } = useApp();
-  const [trail, setTrail] = useState<Trail | null>(null);
+  const { graphData, selectedNode, selectNode } = useApp();
+  const fgRef = useRef<any>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
 
-  // Apply sidebar filters
-  const filteredData = useMemo(() => {
-    if (!graphData) return graphData;
-    let nodes = graphData.nodes as any[];
-    let edges = graphData.edges as any[];
-
-    if (filterBreakingOnly) {
-      const breakIds = new Set<string>();
-      edges.filter((e: any) => e.data?.break_risk === 'high')
-        .forEach((e: any) => { breakIds.add(e.source); breakIds.add(e.target); });
-      nodes = nodes.filter((n: any) => breakIds.has(n.id));
-      edges = edges.filter((e: any) => breakIds.has(e.source) && breakIds.has(e.target));
-    }
-
-    if (filterHideLowConf) {
-      edges = edges.filter((e: any) => (e.data?.confidence ?? 1) >= 0.7);
-    }
-
-    return { nodes, edges };
-  }, [graphData, filterBreakingOnly, filterHideLowConf]);
-
-  const { rfNodes, rfEdges } = useMemo(
-    () => buildLayout(filteredData?.nodes || [], filteredData?.edges || []),
-    [filteredData],
-  );
-
-  // Stamp trail flag onto edges for DepEdge rendering
-  const markedEdges = useMemo(() => {
-    if (!trail) return rfEdges;
-    return rfEdges.map(e => ({
-      ...e,
-      data: { ...e.data, isTrail: trail.edgeIds.has(e.id) },
-    }));
-  }, [rfEdges, trail]);
-
-  // Opacity: trail nodes full, others dim; if no trail use selectedNode neighbour logic
-  const styledNodes = useMemo(() => {
-    const isDecor = (id: string) => id.startsWith('zone-bg-');
-
-    return rfNodes.map(n => {
-      const inTrail   = trail ? trail.nodeIds.has(n.id)  : null;
-      const isSelected = n.id === selectedNode;
-
-      let opacity = 1;
-      if (isDecor(n.id)) opacity = 1;
-      else if (trail) opacity = inTrail ? 1 : 0.08;
-      else if (selectedNode) {
-        const neighbors = new Set([selectedNode]);
-        filteredData?.edges.forEach((e: any) => {
-          if (e.source === selectedNode) neighbors.add(e.target);
-          if (e.target === selectedNode) neighbors.add(e.source);
-        });
-        opacity = neighbors.has(n.id) ? 1 : 0.1;
-      }
-
-      return { ...n, selected: isSelected, style: { ...n.style, opacity, transition: 'opacity 0.15s' } };
+  // Track container dimensions for the WebGL canvas
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const obs = new ResizeObserver(entries => {
+      const { width, height } = entries[0].contentRect;
+      setDimensions({ width: Math.floor(width), height: Math.floor(height) });
     });
-  }, [rfNodes, trail, selectedNode, filteredData]);
+    obs.observe(containerRef.current);
+    return () => obs.disconnect();
+  }, []);
 
-  const styledEdges = useMemo(() =>
-    markedEdges.map(e => ({
-      ...e,
-      selected: e.source === selectedNode || e.target === selectedNode,
-      style: {
-        opacity: trail
-          ? (trail.edgeIds.has(e.id) ? 1 : 0.04)
-          : selectedNode
-          ? (e.source === selectedNode || e.target === selectedNode ? 1 : 0.04)
-          : 1,
-        transition: 'opacity 0.15s',
-      },
-    })),
-    [markedEdges, trail, selectedNode],
+  // Apply section-grouping forces after graph mounts using real d3-force
+  useEffect(() => {
+    if (!fgRef.current || !graphData?.nodes.length) return;
+    const fg = fgRef.current;
+
+    // Push DATABASE / BACKEND / FRONTEND into left / center / right bands
+    fg.d3Force(
+      'sectionX',
+      forceX((node: any) => {
+        const layer = node.layer || getLayer(node.language || '');
+        if (layer === 'database') return -350;
+        if (layer === 'frontend') return 350;
+        return 0; // backend
+      }).strength(0.12),
+    );
+
+    // Keep everything near the Z=0 plane (2.5D effect)
+    fg.d3Force(
+      'flattenZ',
+      forceZ(0).strength(0.25),
+    );
+
+    fg.d3ReheatSimulation();
+  }, [graphData]);
+
+  // Selected + neighbor highlight set
+  const highlightedIds = useMemo<Set<string>>(() => {
+    if (!selectedNode || !graphData) return new Set();
+    const s = new Set<string>([selectedNode]);
+    graphData.edges.forEach(e => {
+      if (e.source === selectedNode) s.add(e.target);
+      if (e.target === selectedNode) s.add(e.source);
+    });
+    return s;
+  }, [selectedNode, graphData]);
+
+  // Convert edges → links (the library uses "links" not "edges")
+  const fg3dData = useMemo(() => {
+    if (!graphData) return { nodes: [], links: [] };
+    const links = graphData.edges
+      .map(edge => ({
+        source:        edge.source,
+        target:        edge.target,
+        id:            edge.id,
+        edgeType:      (edge.data as any)?.type || 'FLOWS_TO',
+        confidence:    (edge.data as any)?.confidence ?? 0.5,
+        breakRisk:     (edge.data as any)?.break_risk || 'none',
+        inferredBy:    (edge.data as any)?.inferred_by || 'ast',
+        transformation:(edge.data as any)?.transformation || '',
+      }))
+      .filter(l => l.source && l.target);
+    return { nodes: graphData.nodes, links };
+  }, [graphData]);
+
+  // ── Custom Three.js node object ────────────────────────────────────────────
+  const nodeThreeObject = useCallback((node: any) => {
+    const color      = getLayerColor(node);
+    const isSelected = selectedNode === node.id;
+    const isHit      = highlightedIds.has(node.id);
+    const isDimmed   = highlightedIds.size > 0 && !isHit;
+    const isBoundary = node.is_boundary || false;
+    const severity   = (node as any).severity?.tier as string | undefined;
+
+    const group = new THREE.Group();
+
+    // Sphere radius varies by significance
+    const radius = isBoundary ? 7 : severity === 'CRITICAL' ? 9 : 5;
+    const mat = new THREE.MeshPhongMaterial({
+      color:             isSelected ? '#00e5b8' : color,
+      emissive:          isSelected ? '#007a60' : (isBoundary ? color : '#000000'),
+      emissiveIntensity: isSelected ? 0.7 : (isBoundary ? 0.25 : 0),
+      transparent: true,
+      opacity:     isDimmed ? 0.12 : 1,
+      shininess:   60,
+    });
+    group.add(new THREE.Mesh(new THREE.SphereGeometry(radius, 20, 20), mat));
+
+    // Outer ring for boundary / selected
+    if ((isBoundary || isSelected) && !isDimmed) {
+      const ringMat = new THREE.MeshBasicMaterial({
+        color, side: THREE.DoubleSide, transparent: true,
+        opacity: isSelected ? 0.85 : 0.3,
+      });
+      group.add(new THREE.Mesh(new THREE.RingGeometry(radius + 2, radius + 4, 32), ringMat));
+    }
+
+    // Red glow halo for CRITICAL severity
+    if (severity === 'CRITICAL' && !isDimmed) {
+      group.add(new THREE.Mesh(
+        new THREE.SphereGeometry(radius + 6, 16, 16),
+        new THREE.MeshBasicMaterial({ color: '#ff5733', transparent: true, opacity: 0.10, side: THREE.BackSide }),
+      ));
+    }
+
+    // Primary label sprite
+    const label = (node.name as string) || (node.id as string)?.split('::').pop() || '';
+    const sprite = new SpriteText(label);
+    sprite.color      = isSelected ? '#00e5b8' : (isDimmed ? '#1e3048' : '#e8f0fa');
+    sprite.textHeight = isSelected ? 9 : 5;
+    sprite.position.y = radius + 11;
+    group.add(sprite);
+
+    // Sub-label on selected / highlighted
+    if (isSelected || isHit) {
+      const sub = new SpriteText(
+        `[${node.type || '?'}] ${(node.file as string || '').split('/').pop()}`,
+      );
+      sub.color      = '#8da4bd';
+      sub.textHeight = 3.5;
+      sub.position.y = radius + 20;
+      group.add(sub);
+    }
+
+    return group;
+  }, [selectedNode, highlightedIds]);
+
+  // ── Edge styling ───────────────────────────────────────────────────────────
+  const linkColor = useCallback((link: any) => {
+    const srcId = typeof link.source === 'object' ? link.source.id : link.source;
+    const tgtId = typeof link.target === 'object' ? link.target.id : link.target;
+
+    // Always show a clear baseline graph, then slightly emphasize the
+    // edges touching the selected node instead of hiding the rest.
+    const isConnectedToSelection =
+      !!selectedNode && (srcId === selectedNode || tgtId === selectedNode);
+
+    if (link.breakRisk === 'high') return '#ff5733';
+
+    const base = EDGE_COLORS[link.edgeType as string] || '#2a4060';
+    if (!selectedNode) return base;
+
+    // De-emphasize non-neighbors, but keep them visible
+    return isConnectedToSelection ? base : 'rgba(42,64,96,0.45)';
+  }, [selectedNode]);
+
+  const linkWidth = useCallback((link: any) => {
+    const srcId = typeof link.source === 'object' ? link.source.id : link.source;
+    const tgtId = typeof link.target === 'object' ? link.target.id : link.target;
+    const connected = !selectedNode || srcId === selectedNode || tgtId === selectedNode;
+    if (link.breakRisk === 'high') return 3.0;
+    return connected ? 1.6 : 0.5;
+  }, [selectedNode]);
+
+  const linkDirectionalParticles = useCallback(
+    (link: any) => (link.breakRisk === 'high' ? 4 : 0),
+    [],
   );
 
-  const onNodeClick = useCallback((_: any, node: any) => {
-    if (node.id.startsWith('zone-bg-')) return;
-    if (node.id === selectedNode) {
-      selectNode(null);
-      setTrail(null);
-      return;
-    }
-    selectNode(node.id);
-    if (filteredData) {
-      setTrail(computeTrail(node.id, filteredData.nodes as any[], filteredData.edges as any[]));
-    }
-  }, [selectNode, selectedNode, filteredData]);
-
-  const onPaneClick = useCallback(() => { selectNode(null); setTrail(null); }, [selectNode]);
-
-  if (!filteredData?.nodes?.length) {
+  // ── Empty state ────────────────────────────────────────────────────────────
+  if (!graphData || !graphData.nodes.length) {
     return (
-      <div className="flex-1 flex items-center justify-center" style={{ background: '#04070d' }}>
-        <div style={{ color: '#4a6888', fontFamily: 'Fragment Mono, monospace', fontSize: 13, textAlign: 'center', lineHeight: 1.9 }}>
-          No graph data.<br />
+      <div
+        ref={containerRef}
+        className="flex-1 flex items-center justify-center"
+        style={{ background: '#04070d' }}
+      >
+        <div style={{
+          color: '#4a6888', fontFamily: 'Fragment Mono, monospace', fontSize: '13px',
+          textAlign: 'center', lineHeight: '1.8',
+        }}>
+          No graph data available.<br />
           <span style={{ color: '#2a4060' }}>Run analysis to build the knowledge graph.</span>
         </div>
       </div>
     );
   }
 
-  const breakEdges = rfEdges.filter(e => e.data?.breakRisk === 'high').length;
-  const aiEdges    = rfEdges.filter(e => e.data?.inferredBy === 'llm').length;
-
+  // ─────────────────────────────────────────────────────────────────────────
   return (
-    <div style={{ flex: 1, background: '#04070d', width: '100%', height: '100%', minHeight: 400, position: 'relative' }}>
-      <ReactFlow
-        nodes={styledNodes}
-        edges={styledEdges}
-        nodeTypes={nodeTypes}
-        edgeTypes={edgeTypes}
-        onNodeClick={onNodeClick}
-        onPaneClick={onPaneClick}
-        fitView
-        fitViewOptions={{ padding: 0.06 }}
-        minZoom={0.02}
-        maxZoom={3}
-        proOptions={{ hideAttribution: true }}
-        style={{ background: '#04070d' }}
-        nodesDraggable
-        nodesConnectable={false}
-        elementsSelectable
+    <div
+      ref={containerRef}
+      className="flex-1 relative overflow-hidden"
+      style={{ background: '#04070d', width: '100%', height: '100%', minHeight: 400 }}
+    >
+      {/* Section labels */}
+      <div className="absolute top-3 inset-x-0 z-20 flex justify-around px-4 pointer-events-none">
+        {([
+          { label: 'DATABASE',  color: '#f59e0b' },
+          { label: 'BACKEND',   color: '#a78bfa' },
+          { label: 'FRONTEND',  color: '#38bdf8' },
+        ] as const).map(s => (
+          <div
+            key={s.label}
+            style={{
+              fontFamily: 'Syne, sans-serif', fontSize: '10px', fontWeight: 700,
+              letterSpacing: '0.15em', color: s.color, opacity: 0.75,
+              background: `${s.color}12`, border: `1px solid ${s.color}30`,
+              padding: '3px 12px', borderRadius: '4px',
+            }}
+          >
+            {s.label}
+          </div>
+        ))}
+      </div>
+
+      {/* Controls hint */}
+      <div className="absolute top-12 right-4 z-20 pointer-events-none"
+        style={{ fontFamily: 'Fragment Mono, monospace', fontSize: '9px', color: '#2a4060' }}>
+        drag · scroll to zoom · click to inspect
+      </div>
+
+      {/* Edge legend */}
+      <div
+        className="absolute bottom-4 left-4 z-20 p-3 rounded-xl"
+        style={{ background: 'rgba(7,13,22,0.88)', backdropFilter: 'blur(16px)', border: '1px solid rgba(255,255,255,0.05)' }}
       >
-        <Background variant={BackgroundVariant.Dots} gap={28} size={1} color="#0c1b2a" />
-
-        <Controls style={{ background: 'rgba(7,13,22,0.92)', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 8 }} showInteractive={false} />
-
-        <MiniMap
-          style={{ background: 'rgba(7,13,22,0.92)', border: '1px solid rgba(255,255,255,0.06)' }}
-          nodeColor={(n: any) => {
-            if (n.id.startsWith('zone-')) return 'transparent';
-            const layer = n.data?._layer || LANG_LAYER[n.data?.language || ''] || 'backend';
-            return ZONE[layer]?.color || '#4a6888';
-          }}
-          maskColor="rgba(4,7,13,0.78)"
-        />
-
-        {/* Legend */}
-        <Panel position="bottom-left">
-          <div style={{
-            background: 'rgba(6,12,22,0.95)', backdropFilter: 'blur(14px)',
-            border: '1px solid rgba(255,255,255,0.06)', borderRadius: 10,
-            padding: '10px 14px', fontFamily: 'Fragment Mono, monospace',
-          }}>
-            <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.14em', color: '#3a5a78', marginBottom: 8, fontFamily: 'Syne, sans-serif' }}>
-              EDGE TYPES
-            </div>
-            {([
-              { color: '#00e5b8', label: 'MAPS_TO',        dash: false },
-              { color: '#38bdf8', label: 'SERIALIZES_TO',  dash: false },
-              { color: '#34d399', label: 'RENDERS',        dash: false },
-              { color: '#7c3aed', label: 'FLOWS_TO',       dash: false },
-              { color: '#818cf8', label: 'EXPOSES_AS',     dash: false },
-              { color: '#ff5733', label: 'CRITICAL BREAK', dash: false },
-              { color: '#7a9ab8', label: 'LLM Inferred',   dash: true  },
-            ] as const).map(e => (
-              <div key={e.label} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-                <svg width="22" height="6" style={{ flexShrink: 0 }}>
-                  <line x1="0" y1="3" x2="22" y2="3" stroke={e.color} strokeWidth="2" strokeDasharray={e.dash ? '6 3' : undefined} />
-                </svg>
-                <span style={{ fontSize: 9, color: '#7a9ab8' }}>{e.label}</span>
-              </div>
-            ))}
-            {trail && (
-              <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid rgba(255,255,255,0.06)' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 2 }}>
-                  <svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#00e5b8" strokeWidth="2.5" /></svg>
-                  <span style={{ fontSize: 9, color: '#00e5b8' }}>Active Trail</span>
-                </div>
-              </div>
-            )}
+        <div style={{ fontFamily: 'Syne, sans-serif', fontSize: '9px', fontWeight: 600,
+          letterSpacing: '0.12em', color: '#4a6888', marginBottom: '8px' }}>
+          RELATIONSHIP TYPES
+        </div>
+        {([
+          { color: '#00e5b8', label: 'MAPS_TO — SQL → Python' },
+          { color: '#38bdf8', label: 'SERIALIZES_TO — Python → TS' },
+          { color: '#34d399', label: 'RENDERS — TS → React' },
+          { color: '#818cf8', label: 'EXPOSES_AS — route API' },
+          { color: '#ff5733', label: 'CRITICAL BREAK' },
+          { color: '#2a4060', label: 'AST / IMPORT' },
+        ] as const).map(e => (
+          <div key={e.label} style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '3px' }}>
+            <div style={{ width: '18px', height: '2px', background: e.color, borderRadius: '1px' }} />
+            <span style={{ fontFamily: 'Fragment Mono, monospace', fontSize: '9px', color: '#8da4bd' }}>
+              {e.label}
+            </span>
           </div>
-        </Panel>
+        ))}
+      </div>
 
-        {/* Stats */}
-        <Panel position="top-right">
-          <div style={{
-            background: 'rgba(6,12,22,0.92)', border: '1px solid rgba(255,255,255,0.05)',
-            borderRadius: 7, padding: '6px 12px',
-            fontFamily: 'Fragment Mono, monospace', fontSize: 9, lineHeight: 1.9,
-          }}>
-            <div style={{ color: '#3a5a78' }}>{filteredData.nodes.length} nodes · {filteredData.edges.length} edges</div>
-            {breakEdges > 0 && <div style={{ color: '#ff573388' }}>⚠ {breakEdges} breaking</div>}
-            {aiEdges    > 0 && <div style={{ color: '#7c3aed88' }}>✦ {aiEdges} AI edges</div>}
-            {trail && <div style={{ color: '#00e5b8' }}>⟡ trail: {trail.nodeIds.size} nodes</div>}
-          </div>
-        </Panel>
+      {/* Stats badge */}
+      <div className="absolute bottom-4 right-4 z-20"
+        style={{ fontFamily: 'Fragment Mono, monospace', fontSize: '9px', color: '#4a6888',
+          background: 'rgba(7,13,22,0.85)', border: '1px solid rgba(255,255,255,0.05)',
+          padding: '4px 10px', borderRadius: '6px' }}>
+        {graphData.nodes.length} nodes · {graphData.edges.length} edges
+      </div>
 
-        {/* Click hint */}
-        {!selectedNode && !trail && (
-          <Panel position="top-center">
-            <div style={{
-              fontFamily: 'Fragment Mono, monospace', fontSize: 9,
-              color: 'rgba(255,255,255,0.2)', background: 'rgba(5,10,18,0.8)',
-              border: '1px solid rgba(255,255,255,0.06)', borderRadius: 6,
-              padding: '4px 14px', marginTop: 8,
-            }}>
-              Click any node to trace its variable trail through DB → Backend → Frontend
-            </div>
-          </Panel>
-        )}
-      </ReactFlow>
-
-      {/* Trail panel overlay */}
-      {trail && filteredData && (
-        <TrailPanel
-          trail={trail}
-          nodes={filteredData.nodes as any[]}
-          edges={filteredData.edges as any[]}
-          onClose={() => { setTrail(null); selectNode(null); }}
-        />
-      )}
+      {/* 3D Force Graph */}
+      <ForceGraph3D
+        ref={fgRef}
+        graphData={fg3dData}
+        width={dimensions.width}
+        height={dimensions.height}
+        backgroundColor="#04070d"
+        nodeRelSize={6}
+        nodeThreeObject={nodeThreeObject}
+        nodeThreeObjectExtend={false}
+        linkColor={linkColor}
+        linkWidth={linkWidth}
+        linkOpacity={1}
+        linkDirectionalArrowLength={3.5}
+        linkDirectionalArrowRelPos={1}
+        linkDirectionalArrowColor={linkColor}
+        linkDirectionalParticles={linkDirectionalParticles}
+        linkDirectionalParticleColor={() => '#ff5733'}
+        linkDirectionalParticleSpeed={0.005}
+        linkDirectionalParticleWidth={1.5}
+        onEngineStop={() => {
+          // Auto-fit the view once the layout has stabilized so the
+          // full graph is visible without manual zoom/pan.
+          if (fgRef.current) {
+            try {
+              fgRef.current.zoomToFit(400, 80);
+            } catch {
+              // ignore view errors
+            }
+          }
+        }}
+        onNodeClick={(node: any) => selectNode(node.id)}
+        onBackgroundClick={() => selectNode(null)}
+        d3AlphaDecay={0.025}
+        d3VelocityDecay={0.3}
+        cooldownTicks={250}
+        showNavInfo={false}
+      />
     </div>
   );
 };

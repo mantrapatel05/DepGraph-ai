@@ -135,14 +135,24 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, []);
 
   const startAnalysisStream = useCallback(async (repoUrl: string) => {
+    // Reset state so we never show the previous repo's graph or status
     setAnalysisRunning(true);
     setAnalysisComplete(false);
     setTerminalLines([]);
+    setGraphData(null);
+    setGraphError(null);
+    setChains([]);
+    setRoutes([]);
+    setSelectedNode(null);
+    setImpactData(null);
+    setSelectedDiffFile(null);
     setRepoUrl(repoUrl);
 
     if (wsRef.current) wsRef.current.close();
     
-    const ws = new WebSocket(`ws://localhost:8000/ws/progress`);
+    const backendUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+    const wsUrl = backendUrl.replace(/^http/, 'ws') + '/ws/progress';
+    const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
     ws.onopen = () => {
